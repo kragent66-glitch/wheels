@@ -129,7 +129,7 @@ with these environment variables. There is one so far:
 
 | Package | Library | Targets | Source (sha256) | Licence |
 |---|---|---|---|---|
-| PyYAML | libyaml 0.2.5 | 3.14t and 3.15 on Linux x86_64 (glibc) | [yaml-0.2.5.tar.gz](https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz) (`c642ae9b75fee120b2d96c712538bd2cf283228d2337df2cf2988e3c02678ef4`) | MIT |
+| PyYAML | libyaml 0.2.6 | 3.14t and 3.15 on Linux x86_64 (glibc) | [yaml-0.2.6.tar.gz](https://github.com/yaml/libyaml/releases/download/0.2.6/yaml-0.2.6.tar.gz) (`43b393a117bd4fe39812fddc94e3d654359a3ae05653dcf0110a1122d1747e61`) | MIT |
 
 What happens with it, and what is checked:
 
@@ -150,7 +150,7 @@ What happens with it, and what is checked:
   sha256 of the whole recipe definition (steps, flags, environment and check included). The trusted job takes it
   only if it is exactly what the plan gave that pair, in both builds, and a result that names a recipe for a pair
   that has none is rejected. The record goes into the manifest and the wheel's entry in `data/gap-wheels.json`
-  (`recipes`), and the [wheels page](https://wheelgap.github.io/wheels/) says "bundles libyaml 0.2.5 (MIT)".
+  (`recipes`), and the [wheels page](https://wheelgap.github.io/wheels/) says "bundles libyaml 0.2.6 (MIT)".
 - **The install test** runs the recipe's check, as above, in a container with no compiler and no libyaml.
 
 A package known to need a library is never built without a recipe: PyYAML on Alpine or Windows, and psycopg2,
@@ -220,11 +220,14 @@ whether its source is safe.
   hash-verified lock for the PEP 517 build backend, all resolved dependencies and pip. Both builds must use
   that lock. If the Python patch version, compiler/linker versions or recorded runner image differ, the pair is
   rejected even when its wheel bytes match. Missing provenance also prevents publication.
-- **A build that links in a library other than the reviewed one.** A [library recipe](#library-recipes) pins the
-  library's source archive by sha256 and its build steps by the recipe's own sha256. Both builds must record the
-  recipe the coordinator planned for the pair, and no other pair may record one. A missing library can't turn
-  into a wheel without it: where the package has a switch for that the recipe sets it, and the install test checks
-  the library is in use.
+- **A build that picks up a library other than the reviewed one by accident.** A [library recipe](#library-recipes)
+  pins the library's source archive by sha256 and its build steps by the recipe's own sha256. Both builds must
+  record the recipe the coordinator planned for the pair, and no other pair may record one. A missing library can't
+  turn into a wheel without it: where the package has a switch for that the recipe sets it, and the install test
+  checks the library is in use. These are our build script's own steps and records, made inside the build run: they
+  show what the pipeline did at this commit, not what the package's build code then did with the library. A package
+  whose build ignores or replaces it is a malicious sdist (below); the control that remains is that the two builds
+  must still be byte-identical.
 - **A build that tampers with what gets published.** The publish job never runs package code. It trusts only the
   staging job's own output for names and hashes, and re-hashes every file it uploads.
 - **Wrong-platform installs.** A wheel carries exactly one tag, the Python and platform it was built and tested on.
@@ -251,7 +254,7 @@ whether its source is safe.
   compromised upstream tool, or an attack that gives the same compromised inputs to both builds.
 - **A malicious library source, or a mistake in a recipe.** A wheel built with a library recipe contains that
   library's code. Each recipe adds one more pinned source archive to what these wheels trust (for PyYAML,
-  libyaml 0.2.5's release tarball) and our build steps for it. The sha256 shows both builds used the archive a
+  libyaml 0.2.6's release tarball) and our build steps for it. The sha256 shows both builds used the archive a
   maintainer reviewed, not that the archive is safe; the library's `configure` and `make` run in the build as the
   package's own build code does. It is also our build of the library, not the project's or a distro's: a
   security fix in a newer libyaml reaches these wheels only when the recipe is updated and the wheel rebuilt.

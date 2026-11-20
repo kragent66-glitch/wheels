@@ -631,6 +631,19 @@ def bundled_licence_problem(wheel: bytes, records: list[dict]) -> str | None:
     return None
 
 
+def grafted_library_problem(wheel: bytes) -> str | None:
+    """Why a wheel built with library recipes isn't linked the way a recipe says (None if it is): a recipe's library
+    is static, so auditwheel has nothing to bundle and the wheel has no <dist>.libs/ folder. One there means the
+    extension linked a shared library from somewhere other than the recipe's checked source (a shared library that
+    isn't bundled is refused by missing_libs already). Trusted side: it only reads the wheel's member names."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(wheel)) as z:
+            grafted = any("/" in n and n.partition("/")[0].endswith(".libs") for n in z.namelist())
+    except Exception:  # noqa: BLE001  (an odd zip: a reason, never a crashed batch)
+        return "couldn't read its members"
+    return "bundles a shared library in a .libs folder; a recipe's library must be linked in statically" if grafted else None
+
+
 def _tool_version(cmd: list[str], *, include_path: bool = True) -> str:
     """Record the tool version; omit the ephemeral venv path for hash-locked tools."""
     try:
@@ -2283,7 +2296,7 @@ def cmd_stage(args: argparse.Namespace) -> int:
         if reason is None and stated is None and (stated := metadata_licence(data)) is None:
             reason = "neither PyPI nor its METADATA names an OSI-approved licence"
         if reason is None and recipes:
-            reason = bundled_licence_problem(data, recipes)
+            reason = bundled_licence_problem(data, recipes) or grafted_library_problem(data)
         lines.append(f"| {wheel['name']} | {wheel['version']} | {wheel['target']} | {reason or 'staged'} |")
         if reason is not None:
             continue

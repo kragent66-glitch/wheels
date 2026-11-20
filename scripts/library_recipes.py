@@ -14,7 +14,7 @@ coordinator planned.
 
 Each recipe:
 
-- `library`, `version`: what is built, as the site names it ("bundles libyaml 0.2.5 (MIT)").
+- `library`, `version`: what is built, as the site names it ("bundles libyaml 0.2.6 (MIT)").
 - `targets`: the lab targets it applies to. A package with recipes but none for a target isn't built there.
 - `url`, `sha256`: the source archive. Fetched once per build and checked before it is unpacked.
 - `licence`: the library's SPDX expression; it must pass the same OSI check as a package's (gap_wheels.osi_expression).
@@ -72,12 +72,14 @@ RECIPES: dict[str, tuple[dict, ...]] = {
     "pyyaml": (
         {
             "library": "libyaml",
-            "version": "0.2.5",
+            "version": "0.2.6",
             "targets": ["3.14t linux-x86_64", "3.15 linux-x86_64"],
-            # The release tarball (with a generated ./configure), as attached to the yaml/libyaml 0.2.5 release. The
-            # same bytes as https://pyyaml.org/download/libyaml/yaml-0.2.5.tar.gz, which distros build from.
-            "url": "https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz",
-            "sha256": "c642ae9b75fee120b2d96c712538bd2cf283228d2337df2cf2988e3c02678ef4",
+            # The release tarball (with a generated ./configure), as attached to the yaml/libyaml 0.2.6 release
+            # (2026-11-20; fixes CVE-2026-44842, unbounded nesting depth, which 0.2.5 has). Its sha256 is also the
+            # digest GitHub's API reports for the asset. pyyaml.org and the distros didn't carry 0.2.6 yet when this
+            # was pinned, so there was no second, independent copy to compare: compare one when it appears.
+            "url": "https://github.com/yaml/libyaml/releases/download/0.2.6/yaml-0.2.6.tar.gz",
+            "sha256": "43b393a117bd4fe39812fddc94e3d654359a3ae05653dcf0110a1122d1747e61",
             "licence": "MIT",
             "licence_file": "License",
             "licence_sha256": "c40112449f254b9753045925248313e9270efa36d226b22d82d4cc6c43c57f29",
@@ -101,7 +103,7 @@ RECIPES: dict[str, tuple[dict, ...]] = {
                 "import yaml\n"
                 "import yaml._yaml\n"
                 "assert yaml.__with_libyaml__ is True, 'PyYAML was built without libyaml'\n"
-                "assert yaml._yaml.get_version_string() == '0.2.5', yaml._yaml.get_version_string()\n"
+                "assert yaml._yaml.get_version_string() == '0.2.6', yaml._yaml.get_version_string()\n"
                 "assert yaml.load('a: [1, two]', Loader=yaml.CSafeLoader) == {'a': [1, 'two']}\n"
                 "assert yaml.dump({'a': 1}, Dumper=yaml.CSafeDumper) == 'a: 1\\n'\n"
             ),

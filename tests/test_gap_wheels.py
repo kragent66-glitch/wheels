@@ -1869,8 +1869,8 @@ class RecipeTable(unittest.TestCase):
                     self.assertFalse(any(arg in ("sh", "bash", "-c") for step in r["steps"] for arg in step))
 
     def test_libyaml_is_the_release_tarball_built_static_and_forced(self):
-        self.assertEqual(LIBYAML["url"], "https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz")
-        self.assertEqual(LIBYAML["sha256"], "c642ae9b75fee120b2d96c712538bd2cf283228d2337df2cf2988e3c02678ef4")
+        self.assertEqual(LIBYAML["url"], "https://github.com/yaml/libyaml/releases/download/0.2.6/yaml-0.2.6.tar.gz")
+        self.assertEqual(LIBYAML["sha256"], "43b393a117bd4fe39812fddc94e3d654359a3ae05653dcf0110a1122d1747e61")
         self.assertEqual(sorted(LIBYAML["targets"]), ["3.14t linux-x86_64", "3.15 linux-x86_64"])
         configure = LIBYAML["steps"][0]
         for flag in ("--disable-shared", "--enable-static", "--with-pic", "--prefix={prefix}", "--libdir={prefix}/lib"):
@@ -2164,9 +2164,9 @@ class RecipeProvenance(unittest.TestCase):
         self.assertEqual(verdict, "verified")
         self.assertEqual(verified[0]["recipes"], [self.record])
         self.assertEqual(self.record, {
-            "library": "libyaml", "version": "0.2.5", "licence": "MIT",
-            "url": "https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz",
-            "sha256": "c642ae9b75fee120b2d96c712538bd2cf283228d2337df2cf2988e3c02678ef4",
+            "library": "libyaml", "version": "0.2.6", "licence": "MIT",
+            "url": "https://github.com/yaml/libyaml/releases/download/0.2.6/yaml-0.2.6.tar.gz",
+            "sha256": "43b393a117bd4fe39812fddc94e3d654359a3ae05653dcf0110a1122d1747e61",
             "licence_sha256": "c40112449f254b9753045925248313e9270efa36d226b22d82d4cc6c43c57f29",
             "recipe_sha256": recipes.digest(LIBYAML)})  # fmt: skip
 
@@ -2187,7 +2187,7 @@ class RecipeProvenance(unittest.TestCase):
             ("another recipe", yaml_result(self.two, recipes=[other]), "not the planned ones"),
         ]  # fmt: skip
         for key, value, why in (("sha256", "0" * 64, "not the planned ones"), ("sha256", "C" * 64, "invalid"),
-                                ("url", "https://evil.example/yaml-0.2.5.tar.gz", "not the planned ones"),
+                                ("url", "https://evil.example/yaml-0.2.6.tar.gz", "not the planned ones"),
                                 ("url", "http://github.com/x.tar.gz", "invalid"), ("version", "0.2.4", "not the planned"),
                                 ("licence", "Proprietary", "invalid"), ("licence", "Apache-2.0", "not the planned"),
                                 ("licence_sha256", "1" * 64, "not the planned"), ("recipe_sha256", "2" * 64, "not the"),
@@ -2378,7 +2378,7 @@ class RecipeStage(unittest.TestCase):
 
     def test_without_the_pinned_licence_text_it_isnt_staged(self):
         # The real recipe's sha256, and a wheel carrying some other text (or none) where libyaml's belongs.
-        for data, why in ((self.licensed(), "libyaml 0.2.5's licence text isn't the one its recipe pins"),
+        for data, why in ((self.licensed(), "libyaml 0.2.6's licence text isn't the one its recipe pins"),
                           (b"not a wheel", "couldn't read its bundled libraries' licence files")):  # fmt: skip
             with self.subTest(why):
                 staged, summary, _ = self.stage([self.entry()], data)
