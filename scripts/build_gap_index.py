@@ -4,7 +4,8 @@
 
 Writes <site>/simple/index.html (every project), <site>/simple/<project>/index.html, <site>/index.html (what the index
 is, how to use it with pip and uv, how the wheels are made and how a project opts out; each package's rows have an
-anchor, #<project>, and say who asked for it when data/gap-wheel-requests.json names someone) and
+anchor, #<project>, and say who asked for it when data/gap-wheel-requests.json names someone, and which library a
+wheel built with a library recipe bundles) and
 <site>/data/gap-wheels.json (the transparency record), and <site>/data/status.json (the current installability
 state of each recorded wheel). gap_wheels.py publish writes the raw JSON. Plain HTML, no JavaScript. The site is
 wheelgap.github.io/wheels/; it shares wheelgap.github.io with the tracker, whose stylesheet it uses.
@@ -68,6 +69,32 @@ def usable(w: object) -> bool:
         and isinstance(w.get("sha256"), str)
         and SHA256.fullmatch(w["sha256"]) is not None
     )
+
+
+LIBRARY = re.compile(r"[a-z0-9][a-z0-9+._-]{0,49}", re.ASCII)
+LIBRARY_VERSION = re.compile(r"[0-9][0-9A-Za-z.+_-]{0,39}", re.ASCII)
+SPDX = re.compile(r"[A-Za-z0-9.+() -]{1,100}", re.ASCII)
+
+
+def bundled(w: dict) -> str:
+    """ "bundles libyaml 0.2.5 (MIT)" for a wheel built with library recipes (its entry's `recipes`: a pinned system
+    library linked into it statically, see the README), "" for any other. An entry whose `recipes` isn't the shape
+    publish writes says nothing here rather than something wrong."""
+    recipes = w.get("recipes")
+    if not isinstance(recipes, list) or not 0 < len(recipes) <= 5:
+        return ""
+    parts = []
+    for r in recipes:
+        if not (
+            isinstance(r, dict)
+            and all(isinstance(r.get(k), str) for k in ("library", "version", "licence"))
+            and LIBRARY.fullmatch(r["library"])
+            and LIBRARY_VERSION.fullmatch(r["version"])
+            and SPDX.fullmatch(r["licence"])
+        ):
+            return ""
+        parts.append(f"{r['library']} {r['version']} ({r['licence']})")
+    return "bundles " + ", ".join(parts)
 
 
 def projects(wheels: list) -> dict[str, list[dict]]:
@@ -350,12 +377,13 @@ def human_page(
                 if (project, w["wheel"]) not in gone and filename_version is not None
                 else ""
             )
+            library = f"<br><small>{e(text)}</small>" if (text := bundled(w)) else ""
             rows.append(
                 f'          <tr{anchor}><td><a href="{e(TRACKER)}p/{e(project)}/">{e(w["name"])}</a>{note}</td>'
                 f"<td>{e(str(w.get('version', '')))}</td><td>{e(str(w.get('target', '')))}</td>"
                 f"<td>{e(str(w.get('verified') or ''))}</td><td>{links}</td>"
                 f'<td><a href="{e(RELEASE_URL + w["wheel"])}" aria-label="wheel {e(w["wheel"])}">wheel</a>'
-                f'<br><small title="{e(w["sha256"])}">{e(w["sha256"][:12])}</small></td>'
+                f'<br><small title="{e(w["sha256"])}">{e(w["sha256"][:12])}</small>{library}</td>'
                 f"<td>{install}</td>"
                 f"<td>{e(gone.get((project, w['wheel']), 'in the index'))}</td></tr>"
             )
@@ -415,6 +443,7 @@ tokenizers = {{ index = "wheelgap" }}</code></pre>
         <li>Built twice, in two separate GitHub Actions runs. It only goes up if the two builds come out byte for byte the same.</li>
         <li>Tagged for the one Python and platform it was built and tested on, nothing wider. It can't rely on a DLL your machine might not have.</li>
         <li>On Linux, built in a pinned manylinux_2_28 or Alpine image and repaired there with a pinned auditwheel, which bundles the libraries it needs. It only goes up if every other library it links against is on that platform's standard list (and, for glibc, nothing newer than glibc 2.28), and it's install-tested in a minimal container, not on a build machine.</li>
+        <li>A few packages need a C library the build image doesn't have (PyYAML needs libyaml). For those the library is built first, from one fixed source file whose hash is checked, and linked into the wheel, with its licence text included. The table says which library and version such a wheel bundles, and the install test checks it's really the one in use.</li>
         <li>Installed and imported on a fresh machine before it goes up. On free-threaded Python the GIL has to stay off. This checks that it works, it's not a security check.</li>
         <li>pip checks each file's hash when it downloads it. You can also check where a file came from with <code>gh attestation verify FILE.whl -R wheelgap/wheels</code>.</li>
         <li>Every wheel, its source hash and both build runs are listed in <a href="data/gap-wheels.json">gap-wheels.json</a>; the machine-readable <a href="data/status.json">status.json</a> shows which ones are currently in the index, yanked or withdrawn.</li>

@@ -121,6 +121,10 @@ def validation_errors(data: object, optout: set[str]) -> list[str]:
             if not isinstance(val, str) or not SHA256.fullmatch(val):
                 errors.append(f"{label}: invalid lowercase {key}")
 
+        # Only a wheel built with a library recipe has `recipes`; when it does, it is what publish writes.
+        if "recipes" in entry and not gap_wheels.recipe_records_valid(entry["recipes"]):
+            errors.append(f"{label}: invalid library recipes")
+
         builds = entry.get("builds")
         if not isinstance(builds, list) or len(builds) != 2 or not all(run_url(u) for u in builds):
             errors.append(f"{label}: builds must contain exactly two valid project Actions URLs")
@@ -190,6 +194,7 @@ class PublishedData(unittest.TestCase):
             ("foreign run", lambda w: w.update(batch="https://github.com/other/repo/actions/runs/1")),
             ("bad date", lambda w: w.update(verified="2026-99-99")),
             ("date order", lambda w: w.update(published="2020-01-01")),
+            ("recipes", lambda w: w.update(recipes=[{"library": "libyaml", "version": "0.2.5"}])),
         ]
         for description, mutate in cases:
             with self.subTest(description=description):

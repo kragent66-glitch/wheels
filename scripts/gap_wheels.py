@@ -22,6 +22,10 @@ twice, in separate jobs on separate runners:
 - then made into the wheel that's published (finish_wheel): on Linux repaired with a pinned auditwheel, on Windows
   with the VC++ runtime DLLs it needs bundled by a pinned delvewheel, and a py3-none-<platform> wheel (native code
   without an extension module, such as LightGBM's ctypes DLL) retagged to its target's one exact tag.
+- for a package whose extension needs a system library the build image lacks (PyYAML and libyaml), with that library
+  built first from a pinned, sha256-checked source archive by a reviewed recipe (scripts/library_recipes.py) and
+  linked in statically, and its licence text added to the wheel. Each build records the recipes it used; merge
+  takes them only if they are the ones the plan gave the pair, in both builds.
 
 A wheel is *verified* when both builds give byte-identical wheels from the sdist PyPI publishes (merge checks its
 sha256 against PyPI's), and pip installs that wheel file, with `--only-binary :all:` (compiling nothing), into a fresh
@@ -46,6 +50,8 @@ either. See the stage/install-test/publish section below for what is made public
 from __future__ import annotations
 
 import argparse
+import base64
+import csv
 import datetime as dt
 import email.parser
 import hashlib
@@ -70,6 +76,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import build_lab  # TARGETS, interpreter_problem, the name and version rules
 import build_tool_lock
+import library_recipes  # the allowlist of libraries a build may compile and link in, and for which pairs
 
 SCHEMA = 1
 SDIST = re.compile(r"[A-Za-z0-9._-]{1,120}\.(?:tar\.gz|zip)", re.ASCII)
@@ -117,21 +124,38 @@ def clean_pairs(builds: dict) -> list[dict]:
     return sorted(out, key=lambda p: (build_lab.canonical(p["name"]), p["target"]))
 
 
-def plan(builds: dict, limit: int, only: set[str] | None = None, start: int = 0) -> list[dict]:
+def plan(builds: dict, limit: int, only: set[str] | None = None, start: int = 0,
+         skipped: list[tuple[dict, str]] | None = None) -> list[dict]:  # fmt: skip
     """Two build jobs per pair, at most `limit` pairs, each with the runner (and Docker image) of its target. `start`
-    rotates the (sorted) pairs first, so a weekly batch capped at `limit` reaches the end of the list too."""
+    rotates the (sorted) pairs first, so a weekly batch capped at `limit` reaches the end of the list too.
+
+    A pair whose package has a library recipe for its target (scripts/library_recipes.py) is planned with it: both
+    jobs carry `recipes`, what each build must record. A package known to need a library, with no recipe for the
+    target, isn't planned at all (and goes into `skipped` with why): the lab may have built it on a runner that
+    happens to have the library, which the pinned build image doesn't."""
     jobs = []
-    pairs = [p for p in clean_pairs(builds) if only is None or build_lab.canonical(p["name"]) in only]
+    pairs = []
+    for p in clean_pairs(builds):
+        if only is not None and build_lab.canonical(p["name"]) not in only:
+            continue
+        if (why := library_recipes.missing(p["name"], p["target"])) is not None:
+            if skipped is not None:
+                skipped.append((p, why))
+            continue
+        pairs.append(p)
     if pairs:
         offset = start % len(pairs)
         pairs = pairs[offset:] + pairs[:offset]
     pairs = pairs[:limit]
     for i, pair in enumerate(pairs):
         spec = build_lab.TARGETS[pair["target"]]
+        recipes = library_recipes.records(pair["name"], pair["target"])
         for attempt in (1, 2):
             job = {**pair, "id": str(i), "attempt": attempt, "runner": spec["runner"], "python": spec["python"]}
             if "image" in spec:
                 job["image"] = spec["image"]
+            if recipes:  # only then: a pair without a recipe is planned exactly as before
+                job["recipes"] = recipes
             jobs.append(job)
     return jobs
 
@@ -142,10 +166,14 @@ def cmd_plan(args: argparse.Namespace) -> int:
     # --rotate: start each week `--max` pairs further on, so a capped weekly batch covers every pair in turn. Weeks are
     # counted without resetting (an ISO week number jumps back to 1 each January).
     start = dt.date.today().toordinal() // 7 * args.max if args.rotate else 0
-    jobs = plan(builds, args.max, only, start)
+    no_recipe: list[tuple[dict, str]] = []
+    jobs = plan(builds, args.max, only, start, no_recipe)
+    for pair, why in no_recipe:
+        print(f"{pair['name']} {pair['version']} {pair['target']}: skipped: {why}", file=sys.stderr)
     if args.lock_out:
-        report: list[tuple[str, str]] = []
-        planned = len(jobs) // 2
+        report: list[tuple[str, str]] = [(f"{p['name']} {p['version']} {p['target']}", f"skipped: {why}")
+                                         for p, why in no_recipe]  # fmt: skip
+        planned = len(jobs) // 2 + len(no_recipe)
         jobs, bundle = build_tool_lock.lock_plan(jobs, report)
         Path(args.lock_out).write_text(json.dumps(bundle, sort_keys=True) + "\n", encoding="utf-8")
         if getattr(args, "summary", None):
@@ -409,6 +437,199 @@ def namespace_folders(wheel: Path) -> list[str]:
     return sorted(t for t in tops if f"{t}/__init__.py" not in names)
 
 
+# --- library recipes: a pinned system library, built before the package and linked into it statically ----------------
+#
+# For a pair with recipes (scripts/library_recipes.py: PyYAML needs libyaml), the build first makes each library, in
+# the same image and run as the package: the source archive is fetched and checked against the recipe's sha256 before
+# anything is unpacked, unpacked to a fixed path (as the sdist is, so no build path differs between the two builds),
+# built with the recipe's fixed argv steps under build_env() into one prefix, and must leave a static library there
+# and no shared one. The package's build then sees the prefix through the recipe's environment variables and links
+# the library into its extension: the wheel gains no DT_NEEDED entry and auditwheel has nothing to graft. Each
+# library's licence text, from the checked archive and itself checked against the recipe's sha256, is added to the
+# finished wheel (add_bundled_licences), before hashing, so both builds are compared as published.
+RecipeError = library_recipes.RecipeError
+LIBRARY_ROOT = Path("C:/gw-lib" if os.name == "nt" else "/tmp/gw-lib")
+MAX_LIBRARY_SOURCE_BYTES = 100_000_000
+MAX_LICENCE_BYTES = 200_000
+
+
+def fetch_library_source(recipe: dict, path: Path) -> None:
+    """Download a recipe's source archive to `path`, or raise RecipeError. Nothing is written, so nothing can be
+    unpacked, unless the bytes have the recipe's sha256."""
+    request = urllib.request.Request(recipe["url"], headers={"User-Agent": "wheelgap-library-recipe/1"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            data = response.read(MAX_LIBRARY_SOURCE_BYTES + 1)
+    except (OSError, ValueError) as exc:
+        raise RecipeError(f"couldn't download {recipe['url']}: {exc}") from exc
+    if len(data) > MAX_LIBRARY_SOURCE_BYTES:
+        raise RecipeError(f"{recipe['url']} is bigger than a library source may be")
+    if hashlib.sha256(data).hexdigest() != recipe["sha256"]:
+        raise RecipeError(f"{recipe['url']} isn't the archive the recipe pins (sha256 mismatch)")
+    path.write_bytes(data)
+
+
+def build_libraries(recipes: list[dict], work: Path, root: Path | None = None) -> tuple[dict[str, str], list[bytes]]:
+    """Build each recipe's library, in order, into ROOT/prefix (ROOT emptied first; LIBRARY_ROOT, a fixed path, unless
+    given): (the environment variables that show them to the package's build, each library's licence text). Raises
+    RecipeError (or what unpack and subprocess raise) if anything isn't as the recipe says."""
+    root = LIBRARY_ROOT if root is None else root
+    shutil.rmtree(root, ignore_errors=True)
+    prefix = root / "prefix"
+    env: dict[str, str] = {}
+    licences = []
+    for recipe in recipes:
+        if (why := library_recipes.problem(recipe)) is not None:
+            raise RecipeError(f"not a recipe: {why}")
+        label = f"{recipe['library']} {recipe['version']}"
+        archive = work / "library-sources" / recipe["url"].rsplit("/", 1)[-1]
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        fetch_library_source(recipe, archive)
+        src = unpack(archive, root / "src" / f"{recipe['library']}-{recipe['version']}")
+        licence = src / recipe["licence_file"]
+        if licence.is_symlink() or not licence.is_file() or licence.stat().st_size > MAX_LICENCE_BYTES:
+            raise RecipeError(f"{label}: no licence file {recipe['licence_file']}")
+        text = licence.read_bytes()
+        if hashlib.sha256(text).hexdigest() != recipe["licence_sha256"]:
+            raise RecipeError(f"{label}: its licence text isn't the one the recipe pins")
+        for step in recipe["steps"]:
+            argv = [arg.replace("{prefix}", str(prefix)) for arg in step]
+            done = subprocess.run(argv, cwd=src, check=False, env=build_env(), capture_output=True, text=True,
+                                  errors="replace", timeout=BUILD_TIMEOUT)  # fmt: skip
+            print((done.stdout + done.stderr)[-2000:])
+            if done.returncode != 0:
+                raise RecipeError(f"{label}: `{' '.join(step)}` failed (exit {done.returncode})")
+        for rel in recipe["provides"]:
+            if not (prefix / rel).is_file():
+                raise RecipeError(f"{label}: the build left no {rel}")
+        if shared := sorted(p.name for p in prefix.rglob("*") if re.search(r"\.so(\.[0-9]+)*$", p.name)):
+            raise RecipeError(f"{label}: the build left a shared library ({', '.join(shared[:3])}); it must be static")
+        env.update({k: v.replace("{prefix}", str(prefix)) for k, v in recipe["env"].items()})
+        licences.append(text)
+        print(f"gap_wheels: built {label} from {recipe['url']} (sha256 {recipe['sha256']})")
+    return env, licences
+
+
+def record_hash(data: bytes) -> str:
+    """A file's hash as a wheel's RECORD writes it."""
+    return "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode("ascii")
+
+
+def dist_info_folder(names: list[str]) -> str:
+    """The wheel's one .dist-info folder (RecipeError if there isn't exactly one)."""
+    found = {n.partition("/")[0] for n in names if "/" in n and n.partition("/")[0].endswith(".dist-info")}
+    if len(found) != 1:
+        raise RecipeError("the wheel hasn't exactly one .dist-info folder")
+    return found.pop()
+
+
+def metadata_version(headers: email.message.Message) -> tuple[int, int] | None:
+    found = re.fullmatch(r"(\d{1,3})\.(\d{1,3})", str(headers.get("Metadata-Version", "")).strip(), re.ASCII)
+    return (int(found.group(1)), int(found.group(2))) if found else None
+
+
+def with_licence_files(metadata: bytes, paths: list[str]) -> bytes:
+    """A wheel's METADATA with a `License-File` line for each of `paths` (relative to .dist-info/licenses/), added as
+    the last headers, before the description. Only for Metadata-Version 2.4 and later, where PEP 639 defines the
+    field and that folder; older metadata is returned as it is (the file is still added to the wheel, in the same
+    place, but that metadata has no standard field to name it in)."""
+    text = metadata.decode("utf-8")
+    version = metadata_version(email.parser.HeaderParser().parsestr(text))
+    if version is None or "\r" in text:
+        raise RecipeError("the wheel's METADATA isn't in a shape a licence file can be added to")
+    if version < (2, 4):
+        return metadata
+    head, blank, body = text.partition("\n\n")
+    lines = "".join(f"\nLicense-File: {p}" for p in paths)
+    return (head.rstrip("\n") + lines + (blank + body if blank else "\n")).encode("utf-8")
+
+
+def add_bundled_licences(wheel: Path, out_dir: Path, records: list[dict], texts: list[bytes]) -> Path:
+    """The wheel, rewritten into OUT_DIR, with each recipe's licence text at library_recipes.licence_member, named in
+    METADATA (with_licence_files) and listed in RECORD, whose METADATA line is updated too. Every other member keeps
+    its bytes, order, timestamp and mode, and the new ones take METADATA's, so the result depends on nothing but the
+    wheel and the texts: both builds, given equal wheels, write equal files. Raises RecipeError if the wheel isn't
+    one this can be done to."""
+    with zipfile.ZipFile(wheel) as z:
+        infos = z.infolist()
+        names = [i.filename for i in infos]
+        folder = dist_info_folder(names)
+        meta_name, record_name = f"{folder}/METADATA", f"{folder}/RECORD"
+        if len(set(names)) != len(names) or meta_name not in names or record_name not in names:
+            raise RecipeError("the wheel's members aren't what a wheel has")
+        contents = {i.filename: z.read(i) for i in infos}
+    by_name = {i.filename: i for i in infos}
+    added: dict[str, bytes] = {}
+    for rec, text in zip(records, texts, strict=True):
+        member = library_recipes.licence_member(folder, rec)
+        if member in contents or member in added:
+            raise RecipeError(f"the wheel already has {member}")
+        added[member] = text
+    contents[meta_name] = with_licence_files(contents[meta_name], [m[len(f"{folder}/licenses/"):] for m in added])
+    rows = [row for row in csv.reader(io.StringIO(contents[record_name].decode("utf-8"))) if row]
+    if sum(row[0] == meta_name for row in rows) != 1 or sum(row[0] == record_name for row in rows) != 1:
+        raise RecipeError("the wheel's RECORD doesn't list METADATA and itself once each")
+    listed = [[meta_name, record_hash(contents[meta_name]), str(len(contents[meta_name]))] if row[0] == meta_name
+              else row for row in rows if row[0] != record_name]  # fmt: skip
+    listed += [[member, record_hash(text), str(len(text))] for member, text in added.items()]
+    listed.append([record_name, "", ""])
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="\n").writerows(listed)
+    contents[record_name] = buf.getvalue().encode("utf-8")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / wheel.name
+    with zipfile.ZipFile(out, "w") as z:
+
+        def put(name: str, like: zipfile.ZipInfo, data: bytes) -> None:
+            info = zipfile.ZipInfo(name, like.date_time)
+            info.external_attr, info.compress_type, info.create_system = (
+                like.external_attr, like.compress_type, like.create_system)  # fmt: skip
+            z.writestr(info, data)
+
+        for i in infos:
+            if i.filename != record_name:
+                put(i.filename, i, contents[i.filename])
+        for member, text in added.items():
+            put(member, by_name[meta_name], text)
+        put(record_name, by_name[record_name], contents[record_name])  # last, as wheels have it
+    return out
+
+
+def bundled_licence_problem(wheel: bytes, records: list[dict]) -> str | None:
+    """Why a wheel built with library recipes doesn't carry each library's licence text as its record says (None if it
+    does): the file is where add_bundled_licences puts it, exactly once, with the recipe's sha256; RECORD lists it
+    with that hash and size; and METADATA 2.4 or later names it in a License-File line. Trusted side: it only reads
+    the wheel's bytes, and anything it can't read is a reason."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(wheel)) as z:
+            names = z.namelist()
+            folder = dist_info_folder(names)
+            meta_name, record_name = f"{folder}/METADATA", f"{folder}/RECORD"
+            if names.count(meta_name) != 1 or names.count(record_name) != 1:
+                return "couldn't read its bundled libraries' licence files"
+            metadata, record = bounded(z, meta_name, 1_000_000), bounded(z, record_name, 20_000_000)
+            if metadata is None or record is None:
+                return "couldn't read its bundled libraries' licence files"
+            headers = email.parser.HeaderParser().parsestr(metadata.decode("utf-8"))
+            version = metadata_version(headers)
+            named = {str(v).strip() for v in headers.get_all("License-File") or []}
+            rows = {row[0]: row[1:] for row in csv.reader(io.StringIO(record.decode("utf-8"))) if row}
+            for rec in records:
+                label = f"{rec['library']} {rec['version']}"
+                member = library_recipes.licence_member(folder, rec)
+                text = bounded(z, member, MAX_LICENCE_BYTES) if names.count(member) == 1 else None
+                if text is None:
+                    return f"doesn't carry {label}'s licence text"
+                if hashlib.sha256(text).hexdigest() != rec["licence_sha256"]:
+                    return f"{label}'s licence text isn't the one its recipe pins"
+                if rows.get(member) != [record_hash(text), str(len(text))]:
+                    return f"its RECORD doesn't list {label}'s licence text"
+                if version is None or (version >= (2, 4) and member[len(f"{folder}/licenses/"):] not in named):
+                    return f"its METADATA doesn't name {label}'s licence file"
+    except Exception:  # noqa: BLE001  (an odd zip, member, encoding or CSV: a reason, never a crashed batch)
+        return "couldn't read its bundled libraries' licence files"
+    return None
+
 
 def _tool_version(cmd: list[str], *, include_path: bool = True) -> str:
     """Record the tool version; omit the ephemeral venv path for hash-locked tools."""
@@ -563,14 +784,21 @@ def run_build(
     platform_pattern: str | None = None,
     lock: dict | None = None,
     lock_sha256: str | None = None,
+    recipes: list[dict] | None = None,
 ) -> dict:
     """Download the sdist, build the wheel from a fixed folder, hash it, and (first attempt) install it from a local
     folder into a fresh venv with nothing compiled. On Linux the wheel is repaired to `plat` (auditwheel); on Windows
     the DLLs it needs that a user may lack are bundled (delvewheel); a py3-none-<platform> wheel is retagged to `tag`,
     the target's one publishable tag. All before hashing, so both builds are compared as published. Fields left None
-    mean that step didn't happen."""
+    mean that step didn't happen.
+
+    With `recipes` (the pair's library recipes), each library is built first (build_libraries), the package's build
+    gets the recipes' environment, the finished wheel gets the libraries' licence texts, and the result has a
+    `recipes` field: what was built, or None if that step didn't happen. Without, nothing here changes."""
     fields: dict = {"sdist": None, "sdist_sha256": None, "wheel": None, "sha256": None,
                     "installs": None, "tools": None}
+    if recipes:
+        fields["recipes"] = None
     env = dict(os.environ, PIP_DISABLE_PIP_VERSION_CHECK="1", PIP_NO_INPUT="1")
     if lock is None or not build_tool_lock.validate(lock) or build_tool_lock.digest(lock) != lock_sha256:
         print("gap_wheels: no trusted build-tool lock; refusing unpinned build", file=sys.stderr)
@@ -595,6 +823,16 @@ def run_build(
     except (build_tool_lock.LockError, OSError, subprocess.SubprocessError) as exc:
         print(f"gap_wheels: locked build setup failed: {exc}", file=sys.stderr)
         return fields
+    library_env: dict[str, str] = {}
+    licences: list[bytes] = []
+    if recipes:
+        # Before the package's build and apart from it: the only download is each recipe's pinned archive.
+        try:
+            library_env, licences = build_libraries(recipes, work)
+        except (ValueError, tarfile.TarError, zipfile.BadZipFile, OSError, subprocess.SubprocessError) as exc:
+            print(f"gap_wheels: library recipe failed: {exc}", file=sys.stderr)
+            return fields
+        fields["recipes"] = [library_recipes.record(r) for r in recipes]
     fixed = Path("C:/gw" if os.name == "nt" else "/tmp/gw")
     try:
         src = unpack(found[0], fixed)
@@ -605,7 +843,7 @@ def run_build(
     try:
         p = subprocess.run([str(py), "-m", "pip", "wheel", "--no-build-isolation", "--no-index", "--no-deps",
                             "--no-cache-dir", "-w", str(out), str(src)], check=False,
-                           env=dict(build_env(), PIP_NO_INDEX="1"), capture_output=True,
+                           env=dict(build_env(), PIP_NO_INDEX="1", **library_env), capture_output=True,
                            text=True, errors="replace", timeout=BUILD_TIMEOUT)  # fmt: skip
         print((p.stdout + p.stderr)[-6000:])
     except subprocess.TimeoutExpired:
@@ -629,6 +867,13 @@ def run_build(
     finished = finish_wheel(wheels[0], work, plat, tag, platform_pattern, locked_python=repair_py)
     if finished is None:
         return fields
+    if recipes:
+        # After the repair and before hashing, in both builds: a statically linked library's notice ships with it.
+        try:
+            finished = add_bundled_licences(finished, work / "licensed", fields["recipes"], licences)
+        except (ValueError, KeyError, csv.Error, zipfile.BadZipFile, OSError) as exc:
+            print(f"gap_wheels: couldn't add the bundled libraries' licence texts: {exc}", file=sys.stderr)
+            return fields
     wheels = [finished]
     fields.update(wheel=wheels[0].name, sha256=sha256(wheels[0]))
     if keep is not None:  # uploaded as this run's `wheel` artifact; stage takes it only if its sha256 is verified
@@ -666,6 +911,10 @@ def cmd_build(args: argparse.Namespace) -> int:
     if (why := build_lab.interpreter_problem(target)) is not None:
         print(f"gap_wheels: this Python isn't {target}'s: {why}", file=sys.stderr)
         return 3
+    if (why := library_recipes.missing(args.name, target)) is not None:
+        # The plan skips such a pair; a build started for one anyway must not make a wheel without the library.
+        print(f"gap_wheels: {args.name} {why}", file=sys.stderr)
+        return 2
     members: dict[str, str] = {}
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         keep = Path(args.wheel_dir) if args.wheel_dir else None
@@ -676,9 +925,11 @@ def cmd_build(args: argparse.Namespace) -> int:
         except (ValueError, OSError, KeyError) as exc:
             print(f"gap_wheels: refusing build without coordinator lock: {exc}", file=sys.stderr)
             return 2
+        # The recipes are this commit's own, looked up here: never taken from a workflow input or from the package.
+        recipes = library_recipes.for_pair(args.name, target)
         fields = run_build(args.name, args.version, args.attempt, Path(tmp), members, keep, plat=plat,
                            tag=PUBLISH_TAGS.get(target), platform_pattern=build_lab.TARGETS[target]["wheel"],
-                           lock=lock, lock_sha256=args.lock_sha256)
+                           lock=lock, lock_sha256=args.lock_sha256, **({"recipes": recipes} if recipes else {}))
     result = {"schema": SCHEMA, "name": args.name, "version": args.version, "target": target,
               "attempt": args.attempt, "runner": args.runner, **fields}  # fmt: skip
     Path(args.out).write_text(json.dumps(result) + "\n", encoding="utf-8")
@@ -766,6 +1017,29 @@ def tool_provenance_valid(value: object) -> bool:
     return True
 
 
+def recipe_records_valid(value: object) -> bool:
+    """The shape of a `recipes` field, wherever untrusted or stored data carries one (a build's result, the manifest,
+    staged.json): a short list of what library_recipes.record writes, no library twice, each licence an OSI-approved
+    SPDX expression. Shape only: whether they are the pair's recipes is checked against the plan and this commit's
+    allowlist (problems, verify, cmd_stage)."""
+    if not isinstance(value, list) or not 0 < len(value) <= library_recipes.MAX_RECIPES:
+        return False
+    seen = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != library_recipes.RECORD_KEYS:
+            return False
+        if not all(isinstance(v, str) for v in item.values()):
+            return False
+        if not (library_recipes.LIBRARY.fullmatch(item["library"]) and item["library"] not in seen
+                and library_recipes.LIBRARY_VERSION.fullmatch(item["version"])
+                and library_recipes.SOURCE_URL.fullmatch(item["url"]) and ".." not in item["url"]
+                and all(SHA256.fullmatch(item[k]) for k in ("sha256", "licence_sha256", "recipe_sha256"))
+                and len(item["licence"]) <= 100 and osi_expression(item["licence"])):  # fmt: skip
+            return False
+        seen.add(item["library"])
+    return True
+
+
 def expected_packages(lock: dict) -> list[dict]:
     return [{"name": w["name"], "version": w["version"], "sha256": w["sha256"],
              "filename": w["filename"]} for w in lock["wheels"]]
@@ -775,7 +1049,12 @@ def problems(result: object, job: dict) -> list[str]:
     """What's wrong with an untrusted result for `job` (empty when it's exactly what `build` writes for that job)."""
     if not isinstance(result, dict):
         return ["not an object"]
-    if set(result) != RESULT_KEYS:
+    planned = job.get("recipes")  # the plan's library recipes for this pair, or nothing
+    if set(result) != (RESULT_KEYS | {"recipes"} if planned else RESULT_KEYS):
+        if set(result) == RESULT_KEYS | {"recipes"}:
+            return ["library recipes on a pair that has none"]
+        if planned and set(result) == RESULT_KEYS:
+            return ["its library recipes are missing"]
         return ["keys"]
     out = []
     if result["schema"] != SCHEMA:
@@ -802,6 +1081,14 @@ def problems(result: object, job: dict) -> list[str]:
         out.append("build tools are missing or invalid")
     elif job.get("lock_sha256") and result["tools"]["lock_sha256"] != job["lock_sha256"]:
         out.append("build tools do not match the planned lock")
+    if planned:
+        if result["recipes"] is None:
+            if result["wheel"] is not None:
+                out.append("a wheel needs its library recipes")
+        elif not recipe_records_valid(result["recipes"]):
+            out.append("library recipes are invalid")
+        elif result["recipes"] != planned:
+            out.append("library recipes are not the planned ones")
     return out
 
 
@@ -880,6 +1167,15 @@ def verify(
             verdict = "the coordinator's build-tool lock does not match the builds"
         elif first["tools"] != second["tools"]:
             verdict = "the two builds used different toolchains"
+        elif (why := library_recipes.missing(job["name"], job["target"])) is not None:
+            verdict = why  # the plan skips such a pair and the build refuses it: never verified without its library
+        elif job.get("recipes") != (library_recipes.records(job["name"], job["target"]) or None):
+            # The plan's own record, against this commit's allowlist: also a pair with a recipe, planned without it.
+            verdict = "the planned library recipes are not this commit's"
+        elif first.get("recipes") != second.get("recipes"):
+            verdict = "the two builds used different library recipes"
+        elif first.get("recipes") != job.get("recipes"):
+            verdict = "the builds' library recipes are not the planned ones"
         elif (sdists := published(job["name"], job["version"])) is None:
             verdict = "couldn't check the sdist against PyPI"
         elif sdists.get(first["sdist"]) != first["sdist_sha256"]:
@@ -890,6 +1186,8 @@ def verify(
             verdict = "verified"
             verified.append({**row, "wheel": first["wheel"], "sha256": first["sha256"], "sdist": first["sdist"],
                              "sdist_sha256": first["sdist_sha256"], "tools": first["tools"]})  # fmt: skip
+            if job.get("recipes"):
+                verified[-1]["recipes"] = first["recipes"]
         report.append({**row, "verdict": verdict})
     return verified, report
 
@@ -1169,11 +1467,15 @@ def cmd_collect(args: argparse.Namespace) -> int:
 #   keep it only if its sha256 is the one both builds reported, it carries exactly its target's one tag, it needs
 #   nothing a user's system may lack (on Windows a DLL, read from its PE imports; on Linux a library or a glibc symbol
 #   version outside the manylinux_2_28 or musllinux_1_2 policy, read from its ELF files), PyPI names an OSI-approved
-#   licence for the release, and the project hasn't opted out. It only parses the wheel's bytes, never runs them.
+#   licence for the release, and the project hasn't opted out. A wheel built with library recipes must also record
+#   exactly this commit's recipes for its pair and carry each library's licence text, with the recipe's sha256
+#   (bundled_licence_problem). It only parses the wheel's bytes, never runs them.
 # install-test (untrusted: it imports package code): on a fresh runner of the target, install each staged wheel
 #   into a new venv and import it as the build lab does; a Linux wheel in a minimal container of its libc with the
-#   target's exact CPython (LINUX_TESTS), not on the runner itself. Its answers only decide whether a byte-verified
-#   wheel is worth publishing; a package's code could lie about them, but never change which bytes are published.
+#   target's exact CPython (LINUX_TESTS), not on the runner itself. A wheel built with library recipes must also pass
+#   each recipe's import check there (library_checks: for PyYAML, that it runs on libyaml, not its pure-Python
+#   fallback). Its answers only decide whether a byte-verified wheel is worth publishing; a package's code could lie
+#   about them, but never change which bytes are published.
 # publish (trusted, never runs package code): re-check every file against the sha256 stage passed it, then add it to
 #   data/gap-wheels.json; the workflow attests the files, uploads them to the `gap-wheels` release and deploys the
 #   index the site builds from that file (scripts/build_gap_index.py).
@@ -1958,6 +2260,17 @@ def cmd_stage(args: argparse.Namespace) -> int:
                 f"| {wheel['name']} | {wheel['version']} | {wheel['target']} | no verified toolchain |"
             )
             continue
+        recipes = wheel.get("recipes")
+        if (
+            library_recipes.missing(wheel["name"], wheel["target"]) is not None
+            or recipes != (library_recipes.records(wheel["name"], wheel["target"]) or None)
+            or (recipes is not None and not recipe_records_valid(recipes))
+        ):
+            # Like the toolchain: before the wheel file is fetched. Also a pair that should have had a recipe.
+            lines.append(
+                f"| {wheel['name']} | {wheel['version']} | {wheel['target']} | no verified library recipe |"
+            )
+            continue
         info = pypi_info(wheel["name"], wheel["version"])
         reason = stage_reason(wheel, info, optout)
         data = None
@@ -1969,6 +2282,8 @@ def cmd_stage(args: argparse.Namespace) -> int:
         stated = licence(info) if info is not None else None
         if reason is None and stated is None and (stated := metadata_licence(data)) is None:
             reason = "neither PyPI nor its METADATA names an OSI-approved licence"
+        if reason is None and recipes:
+            reason = bundled_licence_problem(data, recipes)
         lines.append(f"| {wheel['name']} | {wheel['version']} | {wheel['target']} | {reason or 'staged'} |")
         if reason is not None:
             continue
@@ -1977,6 +2292,8 @@ def cmd_stage(args: argparse.Namespace) -> int:
                                                 "sdist_sha256", "builds", "tools")},
                        "licence": stated, "requires_python": info.get("requires_python") or None,
                        "verified": manifest.get("date"), "batch": manifest.get("run")})  # fmt: skip
+        if recipes:  # carried into data/gap-wheels.json, so the site can say what the wheel bundles
+            staged[-1]["recipes"] = recipes
     staged_file = out / "staged.json"
     staged_file.write_text(json.dumps(staged, indent=1) + "\n", encoding="utf-8")
     staged_sha256 = sha256(staged_file)
@@ -2009,9 +2326,21 @@ def install_test_job(target: str) -> dict[str, str]:
     return job
 
 
-def install_and_import(wheel: Path, target: str, work: Path) -> str | None:
+def library_checks(staged: dict) -> list[str]:
+    """The import checks for a staged wheel built with library recipes (each recipe's fixed `import_check`, from this
+    commit's allowlist); [] for any other wheel. ValueError if the staged record isn't what this commit's recipes
+    give: the checks would be for another build."""
+    recorded = staged.get("recipes")
+    recipes = library_recipes.for_pair(staged["name"], staged["target"])
+    if recorded != ([library_recipes.record(r) for r in recipes] or None):
+        raise ValueError("the staged library recipes aren't this commit's")
+    return [r["import_check"] for r in recipes]
+
+
+def install_and_import(wheel: Path, target: str, work: Path, checks: list[str] | None = None) -> str | None:
     """Install the wheel into a fresh venv (dependencies as pip resolves them) and import it as the build lab does;
-    on free-threaded Python the GIL must stay off. None if it works, else why not."""
+    on free-threaded Python the GIL must stay off. `checks` (library_checks) then run in that venv, each of which
+    fails unless the wheel's bundled library is really in use. None if it works, else why not."""
     venv = work / "venv"
     shutil.rmtree(venv, ignore_errors=True)
     subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True, timeout=INSTALL_TIMEOUT)
@@ -2055,6 +2384,15 @@ def install_and_import(wheel: Path, target: str, work: Path) -> str | None:
         print((r.stdout + r.stderr)[-3000:])
         if r.returncode != 0 or f"native-ok {len(native)}" not in r.stdout:
             return "its native libraries didn't load"
+    for check in checks or []:
+        try:
+            r = subprocess.run([py, "-I", "-c", check], check=False, env=env, capture_output=True, text=True,
+                               errors="replace", timeout=INSTALL_TIMEOUT, cwd=work)  # fmt: skip
+        except subprocess.TimeoutExpired:
+            return "its bundled library check timed out"
+        print((r.stdout + r.stderr)[-3000:])
+        if r.returncode != 0:
+            return "its bundled library isn't in use"
     return None
 
 
@@ -2110,7 +2448,9 @@ def cmd_install_test(args: argparse.Namespace) -> int:
             continue
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             try:
-                why = install_and_import(Path(args.staged) / w["wheel"], args.target, Path(tmp))
+                checks = library_checks(w)
+                why = install_and_import(Path(args.staged) / w["wheel"], args.target, Path(tmp),
+                                         **({"checks": checks} if checks else {}))  # fmt: skip
             except Exception as e:  # noqa: BLE001  (one bad wheel fails itself, not its target's whole test)
                 why = f"the test itself failed ({type(e).__name__})"
         print(f"{w['wheel']}: {why or 'ok'}")
@@ -2151,6 +2491,8 @@ def select(staged: list[dict], tested: dict[str, dict[str, bool]], folder: Path,
         path = folder / name
         if not tool_provenance_valid(w.get("tools")):
             lines.append(f"{name}: no verified build-tool provenance; not published")
+        elif "recipes" in w and not recipe_records_valid(w["recipes"]):
+            lines.append(f"{name}: no verified library recipe; not published")
         elif not path.is_file() or path.is_symlink() or sha256(path) != w["sha256"]:
             lines.append(f"{name}: the staged file isn't the verified one; not published")
         elif not tested.get(w["target"], {}).get(name):
@@ -2173,9 +2515,12 @@ def trusted_staged(text: str) -> list[dict]:
     keys = {"name", "version", "target", "wheel", "sha256", "sdist", "sdist_sha256", "builds", "licence",
             "requires_python", "verified", "batch", "tools"}  # fmt: skip
     if not isinstance(staged, list) or not all(
-        isinstance(w, dict) and set(w) == keys and isinstance(w["wheel"], str) and ASSET.fullmatch(w["wheel"])
+        # `recipes` only on a wheel built with library recipes: one without is exactly what stage wrote before them.
+        isinstance(w, dict) and set(w) in (keys, keys | {"recipes"})
+        and isinstance(w["wheel"], str) and ASSET.fullmatch(w["wheel"])
         and isinstance(w["sha256"], str) and SHA256.fullmatch(w["sha256"]) and w["target"] in build_lab.TARGETS
         and tag_ok(w["wheel"], w["target"]) and tool_provenance_valid(w["tools"])
+        and ("recipes" not in w or recipe_records_valid(w["recipes"]))
         for w in staged
     ):
         raise SystemExit("gap_wheels: --staged-json isn't what stage writes")

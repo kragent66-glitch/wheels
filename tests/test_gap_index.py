@@ -176,6 +176,30 @@ class Index(unittest.TestCase):
         self.assertIn('<div class="matrix-scroll" tabindex="0" role="region" aria-labelledby="published_wheels">', page)
         self.assertNotIn("<script", page)
 
+    def test_a_wheel_built_with_a_library_recipe_says_what_it_bundles(self):
+        libyaml = {"library": "libyaml", "version": "0.2.5", "licence": "MIT", "sha256": "c" * 64,
+                   "url": "https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz",
+                   "licence_sha256": "d" * 64, "recipe_sha256": "e" * 64}  # fmt: skip
+        with_recipe = wheel(name="pyyaml", file="pyyaml-6.0.3-cp315-cp315-manylinux_2_28_x86_64.whl",
+                            version="6.0.3", target="3.15 linux-x86_64", recipes=[libyaml])  # fmt: skip
+        page = (self.build([with_recipe, wheel()]) / "index.html").read_text()
+        self.assertEqual(page.count("<small>bundles libyaml 0.2.5 (MIT)</small>"), 1)
+        row = next(line for line in page.splitlines() if 'id="pyyaml"' in line)
+        self.assertIn(f'<small title="{SHA}">{SHA[:12]}</small><br><small>bundles libyaml 0.2.5 (MIT)</small></td>', row)
+        self.assertNotIn("bundles", next(line for line in page.splitlines() if 'id="tiktoken"' in line))
+        self.assertEqual(build_gap_index.bundled(wheel()), "")
+        two = [libyaml, {**libyaml, "library": "zlib-ng", "version": "2.2.4", "licence": "Zlib"}]
+        self.assertEqual(build_gap_index.bundled(wheel(recipes=two)), "bundles libyaml 0.2.5 (MIT), zlib-ng 2.2.4 (Zlib)")
+        # An entry whose record isn't what publish writes says nothing, and nothing of it reaches the page.
+        for bad in ([], "libyaml", [{**libyaml, "library": "<script>alert(1)</script>"}], [{**libyaml, "version": 5}],
+                    [{**libyaml, "licence": '"><img src=x>'}], [libyaml] * 6, [{"library": "libyaml"}]):  # fmt: skip
+            with self.subTest(bad):
+                self.assertEqual(build_gap_index.bundled(wheel(recipes=bad)), "")
+                page = (self.build([wheel(recipes=bad)]) / "index.html").read_text()
+                self.assertNotIn("bundles", page.split('id="published_wheels"', 1)[1])
+                self.assertNotIn("<script", page)
+                self.assertNotIn("<img", page)
+
     def test_published_table_has_unique_accessible_links_and_keyboard_scrolling(self):
         wheels = [
             wheel(builds=["https://github.com/wheelgap/tracker/actions/runs/1",

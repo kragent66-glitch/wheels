@@ -1737,5 +1737,757 @@ class NativeWithoutExtensions(unittest.TestCase):
                 self.assertIsNone(gap_wheels.retag(src, work, "cp314-cp314t-win_arm64"))
 
 
+# --- library recipes -------------------------------------------------------------------------------------------------
+
+recipes = gap_wheels.library_recipes  # the module gap_wheels itself uses
+YAML = "pyyaml-6.0.3-cp315-cp315-manylinux_2_28_x86_64.whl"
+YAML_TARGET = "3.15 linux-x86_64"
+LIBYAML = recipes.RECIPES["pyyaml"][0]
+LICENCE_TEXT = b"Copyright (c) the libdemo authors\n\nPermission is hereby granted...\n"
+
+
+def yaml_jobs():
+    return attach_locks(gap_wheels.plan({"results": [row("pyyaml", "6.0.3", YAML_TARGET)]}, 5))
+
+
+def yaml_result(job, **over):
+    r = {"schema": 1, "name": job["name"], "version": job["version"], "target": job["target"],
+         "attempt": job["attempt"], "runner": job["runner"], "sdist": "pyyaml-6.0.3.tar.gz", "sdist_sha256": "a" * 64,
+         "wheel": YAML, "sha256": "b" * 64, "installs": True if job["attempt"] == 1 else None,
+         "tools": example_tools(job), "recipes": json.loads(json.dumps(job["recipes"]))}  # fmt: skip
+    r.update(over)
+    return r
+
+
+def demo_recipe(archive=None, **over):
+    """A recipe shaped like libyaml's, for a library that doesn't exist; with `archive`, pinned to those bytes."""
+    r = {**LIBYAML, "library": "libdemo", "version": "1.0", "url": "https://example.org/dl/demo-1.0.tar.gz",
+         "licence_sha256": hashlib.sha256(LICENCE_TEXT).hexdigest(), "provides": ["include/demo.h", "lib/libdemo.a"],
+         "env": {"C_INCLUDE_PATH": "{prefix}/include", "LIBRARY_PATH": "{prefix}/lib", "DEMO_FORCE": "1"}}  # fmt: skip
+    if archive is not None:
+        r["sha256"] = hashlib.sha256(archive).hexdigest()
+    r.update(over)
+    return r
+
+
+def source_archive(licence=LICENCE_TEXT):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, data in (("demo-1.0/License", licence), ("demo-1.0/configure", b"#!/bin/sh\n")):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+class Download:
+    """What urlopen returns: a context manager whose read(n) gives at most n bytes."""
+
+    def __init__(self, data):
+        self.data = data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, n=-1):
+        return self.data if n < 0 else self.data[:n]
+
+
+def record_rows(files):
+    return "".join(f"{name},{gap_wheels.record_hash(data)},{len(data)}\n" for name, data in files.items())
+
+
+def recipe_wheel(folder, metadata_version="2.4"):
+    """A wheel as auditwheel leaves PyYAML's: an extension module, METADATA with a licence file of its own and a
+    description, and a RECORD with real hashes."""
+    info = "pyyaml-6.0.3.dist-info"
+    files = {
+        "yaml/__init__.py": b"__with_libyaml__ = True\n",
+        "yaml/_yaml.cpython-315-x86_64-linux-gnu.so": b"\x7fELF not really",
+        f"{info}/licenses/LICENSE": b"PyYAML's own licence\n",
+        f"{info}/METADATA": (f"Metadata-Version: {metadata_version}\nName: PyYAML\nVersion: 6.0.3\n"
+                             "License-File: LICENSE\n\nYAML is a data serialization format.\n\nLicense-File: not a header\n"
+                             ).encode(),
+        f"{info}/WHEEL": b"Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: cp315-cp315-manylinux_2_28_x86_64\n",
+    }  # fmt: skip
+    path = folder / YAML
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in files.items():
+            z.writestr(zipfile.ZipInfo(name, (2023, 11, 14, 22, 13, 20)), data)
+        z.writestr(zipfile.ZipInfo(f"{info}/RECORD", (2023, 11, 14, 22, 13, 20)),
+                   record_rows(files) + f"{info}/RECORD,,\n")  # fmt: skip
+    return path
+
+
+def rezip(wheel, change):
+    """The wheel's bytes after `change(members)` edits its {name: bytes}."""
+    with zipfile.ZipFile(io.BytesIO(wheel)) as z:
+        members = {i.filename: z.read(i) for i in z.infolist()}
+    change(members)
+    return zipped(members)
+
+
+class RecipeTable(unittest.TestCase):
+    def test_lookup_is_by_canonical_package_and_target(self):
+        for name in ("pyyaml", "PyYAML", "PYYAML"):
+            for target in ("3.15 linux-x86_64", "3.14t linux-x86_64"):
+                with self.subTest(name=name, target=target):
+                    self.assertEqual(recipes.for_pair(name, target), [LIBYAML])
+                    self.assertIsNone(recipes.missing(name, target))
+        self.assertEqual(recipes.for_pair("tiktoken", "3.15 linux-x86_64"), [])
+        self.assertIsNone(recipes.missing("tiktoken", "3.15 linux-x86_64"))
+        self.assertEqual(recipes.records("tiktoken", "3.15 linux-x86_64"), [])
+
+    def test_a_package_that_needs_a_library_has_no_recipe_elsewhere_and_says_so(self):
+        for target in ("3.14 musl-aarch64", "3.14 win-arm64", "3.14t win-arm64", "3.15 win-amd64"):
+            with self.subTest(target):
+                self.assertEqual(recipes.for_pair("pyyaml", target), [])
+                self.assertEqual(recipes.missing("PyYAML", target),
+                                 "needs libyaml, and there is no library recipe for this target")
+        for name in ("psycopg2", "mysqlclient", "h5py"):  # known to need a library; no recipe yet, on any target
+            for target in gap_wheels.build_lab.TARGETS:
+                with self.subTest(name=name, target=target):
+                    self.assertIn("there is no library recipe for this target", recipes.missing(name, target))
+
+    def test_every_recipe_is_pinned_static_osi_licensed_and_only_for_targets_we_build(self):
+        self.assertLessEqual(set(recipes.RECIPES), set(recipes.NEEDS))
+        for package, group in recipes.RECIPES.items():
+            self.assertEqual(package, gap_wheels.build_lab.canonical(package))
+            self.assertTrue(0 < len(group) <= recipes.MAX_RECIPES)
+            self.assertEqual(len({r["library"] for r in group}), len(group))
+            for r in group:
+                with self.subTest(package=package, library=r["library"]):
+                    self.assertIsNone(recipes.problem(r))
+                    self.assertTrue(gap_wheels.osi_expression(r["licence"]))
+                    self.assertTrue(gap_wheels.recipe_records_valid([recipes.record(r)]))
+                    self.assertEqual(set(recipes.record(r)), recipes.RECORD_KEYS)
+                    # Every target has a pinned build image: nothing here builds on a runner's own libraries.
+                    self.assertTrue(all("image" in gap_wheels.build_lab.TARGETS[t] for t in r["targets"]))
+                    self.assertFalse(any(arg in ("sh", "bash", "-c") for step in r["steps"] for arg in step))
+
+    def test_libyaml_is_the_release_tarball_built_static_and_forced(self):
+        self.assertEqual(LIBYAML["url"], "https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz")
+        self.assertEqual(LIBYAML["sha256"], "c642ae9b75fee120b2d96c712538bd2cf283228d2337df2cf2988e3c02678ef4")
+        self.assertEqual(sorted(LIBYAML["targets"]), ["3.14t linux-x86_64", "3.15 linux-x86_64"])
+        configure = LIBYAML["steps"][0]
+        for flag in ("--disable-shared", "--enable-static", "--with-pic", "--prefix={prefix}", "--libdir={prefix}/lib"):
+            self.assertIn(flag, configure)
+        self.assertEqual(LIBYAML["env"]["PYYAML_FORCE_LIBYAML"], "1")  # a missing libyaml fails the build
+        self.assertIn("yaml.__with_libyaml__ is True", LIBYAML["import_check"])
+        self.assertIn("yaml.CSafeLoader", LIBYAML["import_check"])
+        compile(LIBYAML["import_check"], "import_check", "exec")
+
+    def test_the_digest_covers_the_whole_definition(self):
+        base = recipes.record(LIBYAML)["recipe_sha256"]
+        changed = [
+            {**LIBYAML, "steps": [*LIBYAML["steps"], ["make", "check"]]},
+            {**LIBYAML, "steps": [[*LIBYAML["steps"][0], "--enable-shared"], *LIBYAML["steps"][1:]]},
+            {**LIBYAML, "env": {**LIBYAML["env"], "CFLAGS": "-O0"}},
+            {**LIBYAML, "import_check": "import yaml\n"},
+            {**LIBYAML, "targets": [*LIBYAML["targets"], "3.14 musl-aarch64"]},
+            {**LIBYAML, "sha256": "0" * 64},
+        ]
+        digests = {recipes.record(r)["recipe_sha256"] for r in changed}
+        self.assertEqual(len(digests), len(changed))
+        self.assertNotIn(base, digests)
+
+    def test_a_malformed_recipe_is_named(self):
+        for key, bad in (("url", "http://example.org/x.tar.gz"), ("url", "https://example.org/../x.tar.gz"),
+                         ("sha256", "C" * 64), ("targets", ["3.14 linux-x86_64"]), ("targets", []),
+                         ("steps", ["make install"]), ("steps", []), ("provides", ["../lib/libyaml.a"]),
+                         ("licence_file", "/etc/passwd"), ("env", {"lower": "x"}), ("library", "Lib Yaml")):  # fmt: skip
+            with self.subTest(key=key, bad=bad):
+                self.assertIsNotNone(recipes.problem({**LIBYAML, key: bad}))
+        self.assertEqual(recipes.problem({**LIBYAML, "extra": 1}), "keys")
+
+    def test_the_readme_names_every_recipe(self):
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+        self.assertIn("## Adding a recipe", readme)
+        for group in recipes.RECIPES.values():
+            for r in group:
+                self.assertIn(f"{r['library']} {r['version']}", readme)
+                self.assertIn(r["sha256"], readme)
+
+
+RECIPE_BUILDS = {"results": [
+    row("pyyaml", "6.0.3", "3.15 linux-x86_64"),
+    row("PyYAML", "6.0.2", "3.14t linux-x86_64"),
+    row("pyyaml", "6.0.3", "3.14 musl-aarch64"),   # the lab's runner may have libyaml; the build image doesn't
+    row("psycopg2", "2.9.13", "3.15 linux-x86_64"),  # known to need libpq: no recipe yet
+    row("tiktoken", "0.14.0", "3.14 win-arm64"),
+]}  # fmt: skip
+
+
+class RecipePlan(unittest.TestCase):
+    def test_a_pair_with_a_recipe_is_planned_with_it_and_one_that_needs_one_isnt_planned(self):
+        skipped = []
+        jobs = gap_wheels.plan(RECIPE_BUILDS, 10, skipped=skipped)
+        by_pair = {(j["name"], j["target"]): j for j in jobs if j["attempt"] == 1}
+        self.assertEqual(set(by_pair), {("pyyaml", "3.15 linux-x86_64"), ("PyYAML", "3.14t linux-x86_64"),
+                                        ("tiktoken", "3.14 win-arm64")})  # fmt: skip
+        self.assertEqual(len(jobs), 6)
+        for j in jobs:
+            if j["name"].lower() == "pyyaml":
+                self.assertEqual(j["recipes"], [recipes.record(LIBYAML)])
+            else:
+                self.assertNotIn("recipes", j)
+        self.assertEqual({(p["name"], p["target"], why) for p, why in skipped}, {
+            ("pyyaml", "3.14 musl-aarch64", "needs libyaml, and there is no library recipe for this target"),
+            ("psycopg2", "3.15 linux-x86_64", "needs libpq, and there is no library recipe for this target")})
+
+    def test_a_skipped_pair_takes_no_place_in_a_capped_batch_and_is_reported(self):
+        self.assertEqual({j["name"] for j in gap_wheels.plan(RECIPE_BUILDS, 10, {"psycopg2", "tiktoken"})}, {"tiktoken"})
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "builds.json").write_text(json.dumps(RECIPE_BUILDS))
+            seen = []
+
+            def lock_plan(jobs, report):
+                seen.extend(jobs)
+                return attach_locks(jobs), {"schema": 1, "pairs": {}}
+
+            with mock.patch.object(gap_wheels.build_tool_lock, "lock_plan", lock_plan):
+                gap_wheels.main(["plan", str(tmp / "builds.json"), "--max", "3", "--lock-out", str(tmp / "locks.json"),
+                                 "--github-output", str(tmp / "out.txt"), "--summary", str(tmp / "summary.md")])  # fmt: skip
+            self.assertEqual(len(seen), 6)  # three pairs: the two skipped ones didn't use up the cap
+            summary = (tmp / "summary.md").read_text()
+            self.assertIn("**3 locked, 2 skipped** of 5 pairs", summary)
+            self.assertIn("| psycopg2 2.9.13 3.15 linux-x86_64 | skipped: needs libpq, and there is no library recipe "
+                          "for this target |", summary)  # fmt: skip
+            planned = json.loads(dict(line.split("=", 1) for line in (tmp / "out.txt").read_text().splitlines())["all"])
+            self.assertEqual([j.get("recipes") for j in planned if j["name"] == "pyyaml"],
+                             [[recipes.record(LIBYAML)]] * 2)  # fmt: skip
+
+    def test_pairs_without_recipes_are_planned_exactly_as_before(self):
+        jobs = gap_wheels.plan(BUILDS, 10)
+        self.assertEqual(len(jobs), 6)
+        for j in jobs:
+            self.assertEqual(set(j) - {"image"}, {"name", "version", "target", "id", "attempt", "runner", "python"})
+
+
+class RecipeSource(unittest.TestCase):
+    def test_a_sha256_mismatch_fails_closed_before_anything_is_unpacked_or_run(self):
+        archive = source_archive()
+        recipe = demo_recipe(archive)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            for served, why in ((archive + b"\0", "sha256 mismatch"), (b"", "sha256 mismatch")):
+                with self.subTest(len(served)), \
+                     mock.patch.object(gap_wheels.urllib.request, "urlopen", return_value=Download(served)), \
+                     mock.patch.object(gap_wheels, "unpack", side_effect=AssertionError("unpacked")), \
+                     mock.patch.object(gap_wheels.subprocess, "run", side_effect=AssertionError("ran a step")):  # fmt: skip
+                    with self.assertRaisesRegex(gap_wheels.RecipeError, why):
+                        gap_wheels.build_libraries([recipe], tmp / "work", tmp / "root")
+                    self.assertEqual(list((tmp / "work" / "library-sources").iterdir()), [])
+                    self.assertFalse((tmp / "root").exists())
+
+    def test_the_download_is_bounded_and_a_network_error_is_a_recipe_error(self):
+        recipe = demo_recipe(b"x")
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(gap_wheels, "MAX_LIBRARY_SOURCE_BYTES", 3), \
+                 mock.patch.object(gap_wheels.urllib.request, "urlopen", return_value=Download(b"12345")), \
+                 self.assertRaisesRegex(gap_wheels.RecipeError, "bigger"):  # fmt: skip
+                gap_wheels.fetch_library_source(recipe, Path(tmp) / "a.tar.gz")
+            with mock.patch.object(gap_wheels.urllib.request, "urlopen", side_effect=OSError("no route")), \
+                 self.assertRaisesRegex(gap_wheels.RecipeError, "couldn't download"):  # fmt: skip
+                gap_wheels.fetch_library_source(recipe, Path(tmp) / "a.tar.gz")
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    def test_the_request_is_for_the_recipes_own_url(self):
+        archive = source_archive()
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(gap_wheels.urllib.request, "urlopen", return_value=Download(archive)) as urlopen:  # fmt: skip
+            gap_wheels.fetch_library_source(demo_recipe(archive), Path(tmp) / "a.tar.gz")
+            self.assertEqual(urlopen.call_args.args[0].full_url, "https://example.org/dl/demo-1.0.tar.gz")
+            self.assertEqual((Path(tmp) / "a.tar.gz").read_bytes(), archive)
+
+
+class RecipeBuild(unittest.TestCase):
+    def build(self, tmp, recipe, archive, leave=("include/demo.h", "lib/libdemo.a"), exit_code=0):
+        calls = []
+
+        def run(argv, **kw):
+            calls.append((argv, kw))
+            if argv[:2] == ["make", "install"] and exit_code == 0:
+                for rel in leave:
+                    (tmp / "root" / "prefix" / rel).parent.mkdir(parents=True, exist_ok=True)
+                    (tmp / "root" / "prefix" / rel).write_bytes(b"built")
+            return subprocess.CompletedProcess(argv, exit_code, "", "")
+
+        with mock.patch.object(gap_wheels.urllib.request, "urlopen", return_value=Download(archive)), \
+             mock.patch.object(gap_wheels.subprocess, "run", run):  # fmt: skip
+            return gap_wheels.build_libraries([recipe], tmp / "work", tmp / "root"), calls
+
+    def test_fixed_steps_in_the_unpacked_source_with_the_build_environment_and_one_prefix(self):
+        archive = source_archive()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "root" / "prefix" / "lib").mkdir(parents=True)
+            (tmp / "root" / "prefix" / "lib" / "stale.so").write_bytes(b"from an earlier build")  # emptied first
+            (env, licences), calls = self.build(tmp, demo_recipe(archive), archive)
+            prefix = str(tmp / "root" / "prefix")
+            self.assertEqual(env, {"C_INCLUDE_PATH": f"{prefix}/include", "LIBRARY_PATH": f"{prefix}/lib",
+                                   "DEMO_FORCE": "1"})  # fmt: skip
+            self.assertEqual(licences, [LICENCE_TEXT])
+            self.assertEqual([argv for argv, _ in calls], [
+                ["./configure", f"--prefix={prefix}", f"--libdir={prefix}/lib", "--disable-shared", "--enable-static",
+                 "--with-pic", "--disable-dependency-tracking", "CFLAGS=-O2 -fPIC"], ["make"], ["make", "install"]])  # fmt: skip
+            for _, kw in calls:
+                self.assertEqual(kw["cwd"], tmp / "root" / "src" / "libdemo-1.0" / "demo-1.0")
+                self.assertEqual(kw["env"]["SOURCE_DATE_EPOCH"], "1700000000")
+                self.assertNotIn("shell", kw)
+                self.assertNotIn("DEMO_FORCE", kw["env"])  # the recipe's env is for the package's build only
+
+    def test_the_fixed_path_doesnt_depend_on_the_run(self):
+        self.assertEqual(gap_wheels.LIBRARY_ROOT, Path("C:/gw-lib" if sys.platform == "win32" else "/tmp/gw-lib"))
+
+    def test_anything_not_as_the_recipe_says_fails_the_build(self):
+        archive = source_archive()
+        other_licence = source_archive(b"another licence\n")
+        cases = (
+            ("the licence text", demo_recipe(other_licence), other_licence, {}, "licence text isn't the one"),
+            ("no licence file", demo_recipe(archive, licence_file="COPYING"), archive, {}, "no licence file COPYING"),
+            ("a failing step", demo_recipe(archive), archive, {"exit_code": 2}, r"failed \(exit 2\)"),
+            ("a missing output", demo_recipe(archive), archive, {"leave": ("include/demo.h",)}, "left no lib/libdemo.a"),
+            ("a shared library", demo_recipe(archive), archive,
+             {"leave": ("include/demo.h", "lib/libdemo.a", "lib/libdemo.so.1.0")}, "must be static"),
+            ("a malformed recipe", demo_recipe(archive, steps=["make"]), archive, {}, "not a recipe: steps"),
+        )  # fmt: skip
+        for case, recipe, served, how, why in cases:
+            with self.subTest(case), tempfile.TemporaryDirectory() as tmp, \
+                 self.assertRaisesRegex(gap_wheels.RecipeError, why):  # fmt: skip
+                self.build(Path(tmp), recipe, served, **how)
+
+    def run_build(self, tmp, libraries):
+        """run_build for the PyYAML pair with everything around the recipe faked: the calls it made, and its result."""
+        job = yaml_jobs()[0]
+        lock = example_lock(job)
+        wheel = recipe_wheel(tmp)
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append((cmd, kw))
+            if "wheel" in cmd[:4]:
+                out = Path(cmd[cmd.index("-w") + 1])
+                out.mkdir(parents=True)
+                (out / "pyyaml-6.0.3-cp315-cp315-linux_x86_64.whl").write_bytes(b"unrepaired")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        src = tmp / "gw" / "pyyaml-6.0.3"
+        src.mkdir(parents=True)
+        with mock.patch.object(gap_wheels.build_tool_lock, "download_locked",
+                               lambda item, path: path.write_bytes(b"sdist")), \
+             mock.patch.object(gap_wheels.build_tool_lock, "create_build_environment",
+                               return_value=(tmp / "venv" / "bin" / "python", lock["wheels"])), \
+             mock.patch.object(gap_wheels.build_tool_lock, "create_repair_environment",
+                               return_value=(tmp / "repair" / "bin" / "python", lock["repair_wheels"])), \
+             mock.patch.object(gap_wheels, "build_tool_provenance", return_value=example_tools(job)), \
+             mock.patch.object(gap_wheels, "unpack", return_value=src), \
+             mock.patch.object(gap_wheels, "finish_wheel", return_value=wheel), \
+             mock.patch.object(gap_wheels, "build_libraries", libraries), \
+             mock.patch.object(gap_wheels.sys, "platform", "linux"), \
+             mock.patch.dict(gap_wheels.os.environ), \
+             mock.patch.object(gap_wheels.subprocess, "run", run):  # fmt: skip
+            fields = gap_wheels.run_build("pyyaml", "6.0.3", 2, tmp / "work", {}, tmp / "keep", lock=lock,
+                                          lock_sha256=build_tool_lock.digest(lock), recipes=[LIBYAML])  # fmt: skip
+        return fields, calls
+
+    def test_the_package_build_gets_the_recipes_environment_and_the_wheel_its_licence(self):
+        licence = b"libyaml's licence\n"
+        env = {"C_INCLUDE_PATH": "/tmp/gw-lib/prefix/include", "LIBRARY_PATH": "/tmp/gw-lib/prefix/lib",
+               "PYYAML_FORCE_LIBYAML": "1"}  # fmt: skip
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.dict(LIBYAML, licence_sha256=hashlib.sha256(licence).hexdigest()):  # fmt: skip
+            tmp = Path(tmp)
+            fields, calls = self.run_build(tmp, lambda found, work: (env, [licence]))
+            (cmd, kw), = [c for c in calls if "wheel" in c[0][:4]]
+            self.assertLessEqual(env.items(), kw["env"].items())
+            self.assertEqual((kw["env"]["PIP_NO_INDEX"], kw["env"]["SOURCE_DATE_EPOCH"]), ("1", "1700000000"))
+            self.assertIn("--no-index", cmd)
+            self.assertEqual(fields["recipes"], [recipes.record(LIBYAML)])
+            self.assertEqual(fields["wheel"], YAML)
+            kept = (tmp / "keep" / YAML).read_bytes()
+            self.assertEqual(fields["sha256"], hashlib.sha256(kept).hexdigest())
+            self.assertIsNone(gap_wheels.bundled_licence_problem(kept, fields["recipes"]))  # hashed with its licence
+
+    def test_a_failed_recipe_leaves_no_wheel_and_never_starts_the_package_build(self):
+        def failing(found, work):
+            raise gap_wheels.RecipeError("sha256 mismatch")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fields, calls = self.run_build(Path(tmp), failing)
+        self.assertEqual((fields["recipes"], fields["wheel"], fields["sha256"]), (None, None, None))
+        self.assertEqual(calls, [])
+
+    def test_build_looks_the_recipes_up_itself_and_refuses_a_pair_that_needs_one(self):
+        seen = {}
+
+        def fake_run_build(name, version, attempt, work, members, keep=None, **kw):
+            seen.update(kw)
+            return {"sdist": None, "sdist_sha256": None, "wheel": None, "sha256": None, "installs": None,
+                    "tools": None, "recipes": None}  # fmt: skip
+
+        def build(target, tmp):
+            return gap_wheels.main(["build", "--name", "PyYAML", "--version", "6.0.3", "--target", target,
+                                    "--attempt", "1", "--runner", "ubuntu-24.04", "--lock-bundle", "x.json",
+                                    "--lock-sha256", "e" * 64, "--pair-id", "0", "--out", str(Path(tmp) / "r.json")])  # fmt: skip
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(gap_wheels, "run_build", fake_run_build), \
+             mock.patch.object(gap_wheels.build_tool_lock, "load_lock", return_value={}), \
+             mock.patch.object(gap_wheels.build_lab, "interpreter_problem", lambda target: None):  # fmt: skip
+            self.assertEqual(build(YAML_TARGET, tmp), 0)
+            self.assertEqual(seen["recipes"], [LIBYAML])
+            self.assertIn("recipes", json.loads((Path(tmp) / "r.json").read_text()))
+            seen.clear()
+            self.assertEqual(build("3.14 musl-aarch64", tmp), 2)  # no recipe there: no build, no fallback wheel
+            self.assertEqual(seen, {})
+
+
+class RecipeProvenance(unittest.TestCase):
+    def setUp(self):
+        self.jobs = yaml_jobs()
+        self.one, self.two = self.jobs
+        self.record = recipes.record(LIBYAML)
+
+    def verdict(self, first, second, jobs=None):
+        published = {"pyyaml-6.0.3.tar.gz": "a" * 64}
+        verified, report = gap_wheels.verify(jobs or self.jobs, {("0", 1): first, ("0", 2): second},
+                                             lambda name, version: published)  # fmt: skip
+        return verified, report[0]["verdict"]
+
+    def test_both_builds_with_the_planned_recipe_verify_and_the_manifest_carries_it(self):
+        verified, verdict = self.verdict(yaml_result(self.one), yaml_result(self.two))
+        self.assertEqual(verdict, "verified")
+        self.assertEqual(verified[0]["recipes"], [self.record])
+        self.assertEqual(self.record, {
+            "library": "libyaml", "version": "0.2.5", "licence": "MIT",
+            "url": "https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz",
+            "sha256": "c642ae9b75fee120b2d96c712538bd2cf283228d2337df2cf2988e3c02678ef4",
+            "licence_sha256": "c40112449f254b9753045925248313e9270efa36d226b22d82d4cc6c43c57f29",
+            "recipe_sha256": recipes.digest(LIBYAML)})  # fmt: skip
+
+    def test_a_missing_extra_altered_or_mismatched_record_is_rejected(self):
+        without = yaml_result(self.two)
+        del without["recipes"]
+        other = recipes.record(demo_recipe())
+        cases = [
+            ("missing", without, "its library recipes are missing"),
+            ("no record but a wheel", yaml_result(self.two, recipes=None), "a wheel needs its library recipes"),
+            ("empty", yaml_result(self.two, recipes=[]), "library recipes are invalid"),
+            ("not a list", yaml_result(self.two, recipes=self.record), "library recipes are invalid"),
+            ("an extra field", yaml_result(self.two, recipes=[{**self.record, "steps": []}]), "invalid"),
+            ("a field dropped", yaml_result(self.two, recipes=[{k: v for k, v in self.record.items() if k != "url"}]),
+             "invalid"),
+            ("an extra recipe", yaml_result(self.two, recipes=[self.record, other]), "not the planned ones"),
+            ("the same library twice", yaml_result(self.two, recipes=[self.record, self.record]), "invalid"),
+            ("another recipe", yaml_result(self.two, recipes=[other]), "not the planned ones"),
+        ]  # fmt: skip
+        for key, value, why in (("sha256", "0" * 64, "not the planned ones"), ("sha256", "C" * 64, "invalid"),
+                                ("url", "https://evil.example/yaml-0.2.5.tar.gz", "not the planned ones"),
+                                ("url", "http://github.com/x.tar.gz", "invalid"), ("version", "0.2.4", "not the planned"),
+                                ("licence", "Proprietary", "invalid"), ("licence", "Apache-2.0", "not the planned"),
+                                ("licence_sha256", "1" * 64, "not the planned"), ("recipe_sha256", "2" * 64, "not the"),
+                                ("library", "libyaml; rm -rf /", "invalid"), ("version", 5, "invalid")):  # fmt: skip
+            cases.append((f"{key}={value}", yaml_result(self.two, recipes=[{**self.record, key: value}]), why))
+        for case, second, why in cases:
+            with self.subTest(case):
+                verified, verdict = self.verdict(yaml_result(self.one), second)
+                self.assertEqual(verified, [])
+                self.assertTrue(verdict.startswith("rejected: build 2: "), verdict)
+                self.assertIn(why, verdict)
+
+    def test_a_record_on_a_pair_that_has_none_is_rejected(self):
+        jobs = attach_locks(gap_wheels.plan(BUILDS, 1, {"tiktoken"}))
+        published = {"tiktoken-0.14.0.tar.gz": "a" * 64}
+        results = {("0", 1): good(jobs[0]), ("0", 2): {**good(jobs[1]), "recipes": [self.record]}}
+        verified, report = gap_wheels.verify(jobs, results, lambda n, v: published)
+        self.assertEqual((verified, report[0]["verdict"]),
+                         ([], "rejected: build 2: library recipes on a pair that has none"))  # fmt: skip
+        results[("0", 2)] = good(jobs[1])  # and without it, exactly as before
+        verified, report = gap_wheels.verify(jobs, results, lambda n, v: published)
+        self.assertEqual(report[0]["verdict"], "verified")
+        self.assertNotIn("recipes", verified[0])
+
+    def test_the_two_builds_are_compared_and_both_against_the_plan(self):
+        altered = [{**self.record, "sha256": "0" * 64}]
+        with mock.patch.object(gap_wheels, "problems", return_value=[]):  # were the per-result check ever to miss it
+            self.assertEqual(self.verdict(yaml_result(self.one), yaml_result(self.two, recipes=altered))[1],
+                             "the two builds used different library recipes")  # fmt: skip
+            self.assertEqual(self.verdict(yaml_result(self.one, recipes=altered),
+                                          yaml_result(self.two, recipes=altered))[1],
+                             "the builds' library recipes are not the planned ones")  # fmt: skip
+
+    def test_the_plan_must_be_this_commits(self):
+        both = (yaml_result(self.one), yaml_result(self.two))
+        stale = [{**j, "recipes": [{**self.record, "recipe_sha256": "3" * 64}]} for j in self.jobs]
+        self.assertEqual(self.verdict(yaml_result(stale[0]), yaml_result(stale[1]), stale)[1],
+                         "the planned library recipes are not this commit's")  # fmt: skip
+        bare = [{k: v for k, v in j.items() if k != "recipes"} for j in self.jobs]  # planned without its recipe
+        for result in both:
+            del result["recipes"]
+        self.assertEqual(self.verdict(*both, bare)[1], "the planned library recipes are not this commit's")
+        # A package that needs a library where it has no recipe is never verified, whatever the builds say.
+        musl = attach_locks([{**j, "target": "3.14 musl-aarch64", "runner": "ubuntu-24.04-arm"} for j in bare])
+        wheel = "pyyaml-6.0.3-cp314-cp314-musllinux_1_2_aarch64.whl"
+        results = [{**r, "target": "3.14 musl-aarch64", "runner": "ubuntu-24.04-arm", "wheel": wheel,
+                    "tools": example_tools(j)} for r, j in zip(both, musl, strict=True)]  # fmt: skip
+        self.assertEqual(self.verdict(*results, musl)[1],
+                         "needs libyaml, and there is no library recipe for this target")  # fmt: skip
+
+    def test_a_build_that_stopped_before_its_library_has_no_wheel(self):
+        stopped = yaml_result(self.two, recipes=None, wheel=None, sha256=None)
+        self.assertEqual(self.verdict(yaml_result(self.one), stopped)[1], "a build made no wheel")
+
+
+class BundledLicence(unittest.TestCase):
+    def setUp(self):
+        self.record = recipes.record(demo_recipe())
+        self.member = "pyyaml-6.0.3.dist-info/licenses/bundled/libdemo-1.0/LICENSE"
+
+    def licensed(self, tmp, metadata_version="2.4"):
+        (tmp / "in").mkdir(exist_ok=True)
+        return gap_wheels.add_bundled_licences(recipe_wheel(tmp / "in", metadata_version), tmp / "out",
+                                               [self.record], [LICENCE_TEXT])  # fmt: skip
+
+    def test_the_text_goes_under_dist_info_licenses_with_metadata_and_record_updated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            out = self.licensed(tmp)
+            self.assertEqual(out.name, YAML)
+            with zipfile.ZipFile(tmp / "in" / YAML) as before, zipfile.ZipFile(out) as after:
+                self.assertIsNone(after.testzip())
+                names = after.namelist()
+                self.assertEqual(names, [*before.namelist()[:-1], self.member, "pyyaml-6.0.3.dist-info/RECORD"])
+                self.assertEqual(after.read(self.member), LICENCE_TEXT)
+                for info in before.infolist():
+                    if not info.filename.endswith(("/METADATA", "/RECORD")):
+                        self.assertEqual(after.read(info.filename), before.read(info.filename))
+                self.assertEqual({i.date_time for i in after.infolist()}, {(2023, 11, 14, 22, 13, 20)})
+                metadata = after.read("pyyaml-6.0.3.dist-info/METADATA").decode()
+                self.assertEqual(metadata, (
+                    "Metadata-Version: 2.4\nName: PyYAML\nVersion: 6.0.3\nLicense-File: LICENSE\n"
+                    "License-File: bundled/libdemo-1.0/LICENSE\n\n"
+                    "YAML is a data serialization format.\n\nLicense-File: not a header\n"))
+                record = after.read("pyyaml-6.0.3.dist-info/RECORD").decode()
+                # Every line of RECORD is true of the file it names, and every file is named.
+                rows = [line.split(",") for line in record.splitlines()]
+                self.assertEqual([r[0] for r in rows], names)
+                for name, digest, size in rows[:-1]:
+                    self.assertEqual((digest, size), (gap_wheels.record_hash(after.read(name)), str(len(after.read(name)))))
+                self.assertEqual(rows[-1], ["pyyaml-6.0.3.dist-info/RECORD", "", ""])
+            self.assertIsNone(gap_wheels.bundled_licence_problem(out.read_bytes(), [self.record]))
+
+    def test_both_builds_write_the_same_bytes(self):
+        with tempfile.TemporaryDirectory() as one, tempfile.TemporaryDirectory() as two:
+            first, second = self.licensed(Path(one)), self.licensed(Path(two))
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def test_older_metadata_gets_the_file_but_no_license_file_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.licensed(Path(tmp), "2.1")
+            with zipfile.ZipFile(out) as z:
+                self.assertEqual(z.read(self.member), LICENCE_TEXT)
+                self.assertNotIn("bundled/", z.read("pyyaml-6.0.3.dist-info/METADATA").decode())
+            self.assertIsNone(gap_wheels.bundled_licence_problem(out.read_bytes(), [self.record]))
+
+    def test_a_wheel_it_cant_be_added_to_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            once = self.licensed(tmp)
+            with self.assertRaisesRegex(gap_wheels.RecipeError, "already has"):
+                gap_wheels.add_bundled_licences(once, tmp / "twice", [self.record], [LICENCE_TEXT])
+            for case, change in (
+                ("no RECORD", lambda m: m.pop("pyyaml-6.0.3.dist-info/RECORD")),
+                ("two .dist-info folders", lambda m: m.update({"other-1.0.dist-info/METADATA": b""})),
+                ("no metadata version", lambda m: m.update({"pyyaml-6.0.3.dist-info/METADATA": b"Name: PyYAML\n"})),
+                ("RECORD without METADATA", lambda m: m.update({"pyyaml-6.0.3.dist-info/RECORD": b"x.py,,\n"})),
+            ):  # fmt: skip
+                with self.subTest(case):
+                    odd = tmp / f"{case}.whl"
+                    odd.write_bytes(rezip(recipe_wheel(tmp / "in").read_bytes(), change))
+                    with self.assertRaises(gap_wheels.RecipeError):
+                        gap_wheels.add_bundled_licences(odd, tmp / "odd", [self.record], [LICENCE_TEXT])
+
+    def test_the_trusted_side_checks_presence_hash_record_and_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            good_wheel = self.licensed(tmp).read_bytes()
+            plain = recipe_wheel(tmp / "in").read_bytes()
+        meta, record = "pyyaml-6.0.3.dist-info/METADATA", "pyyaml-6.0.3.dist-info/RECORD"
+        cases = (
+            ("never added", plain, "doesn't carry libdemo 1.0's licence text"),
+            ("removed", rezip(good_wheel, lambda m: m.pop(self.member)), "doesn't carry libdemo 1.0's licence text"),
+            ("another text", rezip(good_wheel, lambda m: m.update({self.member: b"All rights reserved.\n"})),
+             "libdemo 1.0's licence text isn't the one its recipe pins"),
+            ("elsewhere", rezip(good_wheel, lambda m: m.update({"LICENSE.libdemo": m.pop(self.member)})),
+             "doesn't carry"),
+            ("not in RECORD", rezip(good_wheel, lambda m: m.update({record: m[record].replace(b"bundled", b"elsewhere")})),
+             "its RECORD doesn't list libdemo 1.0's licence text"),
+            ("not in METADATA", rezip(good_wheel, lambda m: m.update({meta: m[meta].replace(b"bundled/", b"other/")})),
+             "its METADATA doesn't name libdemo 1.0's licence file"),
+            ("not a zip", b"not a wheel", "couldn't read"),
+            ("oversized", rezip(good_wheel, lambda m: m.update({self.member: b"x" * 300_000})), "doesn't carry"),
+        )  # fmt: skip
+        for case, wheel, why in cases:
+            with self.subTest(case):
+                self.assertIn(why, gap_wheels.bundled_licence_problem(wheel, [self.record]))
+        other = recipes.record(demo_recipe(library="libother"))
+        self.assertIn("libother 1.0", gap_wheels.bundled_licence_problem(good_wheel, [self.record, other]))
+
+
+class RecipeStage(unittest.TestCase):
+    def setUp(self):
+        self.record = recipes.record(LIBYAML)
+
+    def stage(self, wheels, data):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "m.json").write_text(json.dumps({"date": "2026-11-20", "run": "R", "wheels": wheels}))
+            args = gap_wheels.main.__globals__["argparse"].Namespace(
+                manifest=str(tmp / "m.json"), staged=str(tmp / "staged"), repo="wheelgap/wheels",
+                optout=str(tmp / "none"), summary=str(tmp / "summary.md"), github_output=None)  # fmt: skip
+            with mock.patch.object(gap_wheels, "pypi_info", return_value=MIT), \
+                 mock.patch.object(gap_wheels, "take_wheel", return_value=(data, None)) as take:  # fmt: skip
+                gap_wheels.cmd_stage(args)
+            text = (tmp / "staged" / "staged.json").read_text()
+            return gap_wheels.trusted_staged(text), (tmp / "summary.md").read_text(), take
+
+    def entry(self, **over):
+        w = verified(name="pyyaml", wheel=YAML, target=YAML_TARGET)
+        w.update({"version": "6.0.3", "sdist": "pyyaml-6.0.3.tar.gz", "recipes": [self.record], **over})
+        return w
+
+    def licensed(self):
+        """A wheel carrying LICENCE_TEXT where libyaml's licence belongs (the tests have no copy of the real one)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            return gap_wheels.add_bundled_licences(recipe_wheel(Path(tmp)), Path(tmp) / "out", [self.record],
+                                                   [LICENCE_TEXT]).read_bytes()  # fmt: skip
+
+    def test_a_recipe_wheel_with_its_licence_text_is_staged_with_its_record(self):
+        record = {**self.record, "licence_sha256": hashlib.sha256(LICENCE_TEXT).hexdigest()}  # pins the stand-in text
+        with mock.patch.object(recipes, "records", return_value=[record]):
+            staged, summary, _ = self.stage([self.entry(recipes=[record])], self.licensed())
+        self.assertEqual([w["wheel"] for w in staged], [YAML])
+        self.assertEqual(staged[0]["recipes"], [record])
+        self.assertEqual(staged[0]["licence"], "MIT")  # the package's own, from PyPI, as before
+        self.assertIn("| pyyaml | 6.0.3 | 3.15 linux-x86_64 | staged |", summary)
+
+    def test_without_the_pinned_licence_text_it_isnt_staged(self):
+        # The real recipe's sha256, and a wheel carrying some other text (or none) where libyaml's belongs.
+        for data, why in ((self.licensed(), "libyaml 0.2.5's licence text isn't the one its recipe pins"),
+                          (b"not a wheel", "couldn't read its bundled libraries' licence files")):  # fmt: skip
+            with self.subTest(why):
+                staged, summary, _ = self.stage([self.entry()], data)
+                self.assertEqual(staged, [])
+                self.assertIn(why, summary)
+
+    def test_a_missing_altered_or_unexpected_record_is_refused_before_the_wheel_is_fetched(self):
+        bare = self.entry()
+        del bare["recipes"]
+        plain = verified()
+        cases = (("missing", bare), ("altered", self.entry(recipes=[{**self.record, "sha256": "0" * 64}])),
+                 ("malformed", self.entry(recipes=[{**self.record, "extra": 1}])),
+                 ("on a pair that has none", {**plain, "recipes": [self.record]}),
+                 ("a target with no recipe", {**bare, "target": "3.14 musl-aarch64",
+                                              "wheel": "pyyaml-6.0.3-cp314-cp314-musllinux_1_2_aarch64.whl"}))  # fmt: skip
+        for case, wheel in cases:
+            with self.subTest(case):
+                staged, summary, take = self.stage([wheel], b"unused")
+                self.assertEqual(staged, [])
+                self.assertIn("no verified library recipe", summary)
+                take.assert_not_called()
+
+    def test_staged_json_takes_a_valid_record_or_none_and_nothing_else(self):
+        base = {**verified(), "licence": "MIT", "requires_python": None, "verified": "2026-11-20", "batch": "R"}
+        self.assertEqual(gap_wheels.trusted_staged(json.dumps([base])), [base])  # as stage wrote it before recipes
+        with_record = {**base, "recipes": [self.record]}
+        self.assertEqual(gap_wheels.trusted_staged(json.dumps([with_record])), [with_record])
+        for bad in (None, [], [{**self.record, "licence": "Proprietary"}], [{**self.record, "extra": 1}],
+                    [self.record] * 2, "libyaml"):  # fmt: skip
+            with self.subTest(bad), self.assertRaises(SystemExit):
+                gap_wheels.trusted_staged(json.dumps([{**base, "recipes": bad}]))
+
+    def test_the_published_entry_carries_the_record(self):
+        data = b"wheel bytes"
+        w = {**verified(sha=hashlib.sha256(data).hexdigest()), "licence": "MIT", "requires_python": None,
+             "verified": "2026-11-20", "batch": "R", "recipes": [self.record]}  # fmt: skip
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "files").mkdir()
+            (tmp / "files" / WIN).write_bytes(data)
+            (tmp / "tested" / "tested-3.14-win-arm64").mkdir(parents=True)
+            (tmp / "tested" / "tested-3.14-win-arm64" / "tested.json").write_text(json.dumps({"tested": {WIN: True}}))
+            args = gap_wheels.main.__globals__["argparse"].Namespace(
+                staged_json=json.dumps([w]), files=str(tmp / "files"), tested=str(tmp / "tested"),
+                index=str(tmp / "index.json"), release_dir=str(tmp / "release"), optout=str(tmp / "none"),
+                run="RUN", summary=None)  # fmt: skip
+            gap_wheels.cmd_publish(args)
+            entry, = json.loads((tmp / "index.json").read_text())["wheels"]
+            self.assertEqual(entry["recipes"], [self.record])
+            new, lines = gap_wheels.select([{**w, "recipes": [{**self.record, "url": "ftp://x"}]}],
+                                           {"3.14 win-arm64": {WIN: True}}, tmp / "files", {})  # fmt: skip
+            self.assertEqual((new, lines), ([], [f"{WIN}: no verified library recipe; not published"]))
+
+
+class RecipeInstallTest(unittest.TestCase):
+    def staged(self, **over):
+        w = {"name": "PyYAML", "version": "6.0.3", "target": YAML_TARGET, "wheel": YAML,
+             "recipes": [recipes.record(LIBYAML)]}  # fmt: skip
+        w.update(over)
+        return w
+
+    def test_the_check_is_the_recipes_own_snippet_for_a_recipe_wheel_and_nothing_otherwise(self):
+        self.assertEqual(gap_wheels.library_checks(self.staged()), [LIBYAML["import_check"]])
+        self.assertEqual(gap_wheels.library_checks(verified()), [])
+        stale = self.staged(recipes=[{**recipes.record(LIBYAML), "recipe_sha256": "0" * 64}])
+        unrecorded = self.staged()
+        del unrecorded["recipes"]
+        for odd in (stale, unrecorded, {**verified(), "recipes": [recipes.record(LIBYAML)]}):
+            with self.subTest(odd.get("recipes")), self.assertRaises(ValueError):
+                gap_wheels.library_checks(odd)
+
+    def test_install_test_runs_the_check_for_recipe_wheels_only(self):
+        seen = []
+
+        def fake(wheel, target, work, **kw):
+            seen.append((wheel.name, kw))
+
+        stale = self.staged(wheel="pyyaml-6.0.2-cp315-cp315-manylinux_2_28_x86_64.whl", recipes=[
+            {**recipes.record(LIBYAML), "recipe_sha256": "0" * 64}])  # fmt: skip
+        other = verified(name="lz4", wheel="lz4-0.14.0-cp315-cp315-manylinux_2_28_x86_64.whl", target=YAML_TARGET)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "staged.json").write_text(json.dumps([self.staged(), other, stale]))
+            with mock.patch.object(gap_wheels.build_lab, "interpreter_problem", return_value=None), \
+                 mock.patch.object(gap_wheels, "install_and_import", fake):  # fmt: skip
+                self.assertEqual(gap_wheels.main(["install-test", "--staged", str(tmp), "--target", YAML_TARGET,
+                                                  "--out", str(tmp / "tested.json")]), 0)  # fmt: skip
+            self.assertEqual(seen, [(YAML, {"checks": [LIBYAML["import_check"]]}), (other["wheel"], {})])
+            self.assertEqual(json.loads((tmp / "tested.json").read_text())["tested"],
+                             {YAML: True, other["wheel"]: True, stale["wheel"]: False})  # fmt: skip
+
+    def test_a_wheel_passes_only_if_its_library_is_really_in_use(self):
+        # A real install: the rewritten wheel (licence added) installs, the licence lands in the environment, and
+        # the check decides. `demo.WITH_LIB` stands in for yaml.__with_libyaml__.
+        record = recipes.record(demo_recipe())
+        check = "import demo\nassert demo.WITH_LIB is True, 'pure-Python fallback'\n"
+        licence = ("import importlib.metadata as m\n"
+                   "assert m.distribution('demo').read_text('licenses/bundled/libdemo-1.0/LICENSE').startswith('Copyright')\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            for name, body, want in (("with", "WITH_LIB = True\n", None),
+                                     ("without", "WITH_LIB = False\n", "its bundled library isn't in use")):  # fmt: skip
+                with self.subTest(name):
+                    (tmp / name).mkdir()
+                    wheel = gap_wheels.add_bundled_licences(tiny_wheel(tmp / name, body), tmp / name / "out",
+                                                            [record], [LICENCE_TEXT])  # fmt: skip
+                    self.assertEqual(gap_wheels.install_and_import(wheel, "3.14 win-arm64", tmp / name / "work",
+                                                                   checks=[licence, check]), want)  # fmt: skip
+
+
 if __name__ == "__main__":
     unittest.main()
