@@ -194,6 +194,7 @@ substitute another filename for your platform. The attestation check needs the
 
 ```powershell
 $wheel = "lightgbm-4.7.0-cp314-cp314-win_arm64.whl"
+$status = @()
 $status = @((Invoke-RestMethod "https://wheelgap.github.io/wheels/data/status.json").wheels | Where-Object { $_.wheel -eq $wheel } | ForEach-Object { $_.status })
 if ($status.Count -eq 1 -and $status[0] -in "in-index", "yanked") { "status: $status" } else { Write-Warning "the index doesn't serve $wheel now (status: $(if ($status) { $status -join ', ' } else { 'no entry in status.json' }))" }
 Invoke-WebRequest "https://github.com/wheelgap/wheels/releases/download/gap-wheels/$wheel" -OutFile $wheel -UseBasicParsing

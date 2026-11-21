@@ -475,7 +475,11 @@ def human_page(
                 state = gone[key]
             elif key in yanked:
                 # Still served, and the Install cell's == pin is the one case where pip and uv take a yanked file.
-                state = "in the index, but PyPI has yanked this release" + (f": {yanked[key]}" if yanked[key] else "")
+                # The reason is the package owner's text: one line of printable characters, and not a page of it.
+                why = " ".join("".join(c for c in yanked[key] if c.isprintable() or c.isspace()).split())
+                if len(why) > 200:
+                    why = why[:200].rstrip() + "…"
+                state = "in the index, but PyPI has yanked this release" + (f": {why}" if why else "")
             else:
                 state = "in the index"
             rows.append(
