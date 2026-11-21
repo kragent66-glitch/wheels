@@ -69,6 +69,65 @@ def target_ok(filename: str, target: object) -> bool:
     return parts[-3] == py and parts[-2] == py + m.group(2)
 
 
+TARGET_PYTHON = re.compile(r"3\.([0-9]{1,2})t? ", re.ASCII)  # "3.14t win-arm64" and "3.14 musl-aarch64" are both 3.14
+CLAUSE = re.compile(r"(>=|<=|==|!=|~=|>|<)\s*([0-9]+(?:\.[0-9]+)*)(\.\*)?", re.ASCII)
+
+
+def target_python(target: object) -> tuple[int, int, int] | None:
+    """The Python a target (current or retired) is for, as pip compares it: (3, 14, 0) for 3.14 and for 3.14t."""
+    m = TARGET_PYTHON.match(target) if isinstance(target, str) else None
+    return (3, int(m.group(1)), 0) if m else None
+
+
+def excluding_clause(requires_python: str, python: tuple[int, ...]) -> str | None:
+    """The first clause of a requires-python value that leaves `python` out, or None if every clause admits it.
+    Raises ValueError for a value this can't read: it knows the comparison operators with plain dotted-number
+    releases, `.*` after `==` and `!=`, and `~=`, and nothing else (no `===`, no pre-releases, no empty clause)."""
+    for clause in requires_python.split(","):
+        m = CLAUSE.fullmatch(clause.strip())
+        if m is None:
+            raise ValueError(clause)
+        op, release, wildcard = m.group(1), tuple(int(n) for n in m.group(2).split(".")), m.group(3) is not None
+        if wildcard and op not in ("==", "!="):
+            raise ValueError(clause)
+        if op == "~=" and len(release) < 2:  # "~=3" has no last number to let vary
+            raise ValueError(clause)
+        width = max(len(release), len(python))
+        ours = python + (0,) * (width - len(python))
+        theirs = release + (0,) * (width - len(release))  # 3.10 is 3.10.0
+        prefix = release[:-1] if op == "~=" else release  # ~=3.9.0 is >=3.9.0, ==3.9.*
+        same_prefix = ours[: len(prefix)] == prefix
+        admits = {
+            ">=": ours >= theirs,
+            "<=": ours <= theirs,
+            ">": ours > theirs,
+            "<": ours < theirs,
+            "==": same_prefix if wildcard else ours == theirs,
+            "!=": not same_prefix if wildcard else ours != theirs,
+            "~=": ours >= theirs and same_prefix,
+        }[op]
+        if not admits:
+            return clause.strip()
+    return None
+
+
+def requires_python_error(value: object, target: object) -> str | None:
+    """What's wrong with an entry's requires_python, or None: it must be null (no limit) or a value that can be read
+    and that admits the target's own Python. An installer skips a file whose requires-python leaves its Python out."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        return f"requires_python must be null or a non-empty string, not {value!r}"
+    python = target_python(target)
+    try:
+        clause = excluding_clause(value, python or (3, 0, 0))
+    except ValueError:
+        return f"can't read requires_python {value!r}"
+    if python is None or clause is None:  # a target it can't read is reported by the target check
+        return None
+    return f"requires_python {clause} excludes Python {python[0]}.{python[1]}, its target"
+
+
 def published_date(value: object) -> dt.date | None:
     if not isinstance(value, str) or not DATE.fullmatch(value):
         return None
@@ -101,6 +160,8 @@ def validation_errors(data: object, optout: set[str]) -> list[str]:
         if filename in seen:
             errors.append(f"{label}: duplicate wheel filename")
         seen.add(filename)
+        if problem := requires_python_error(entry.get("requires_python"), entry.get("target")):
+            errors.append(f"{label}: {problem}")
 
         name, version = entry.get("name"), entry.get("version")
         project = build_gap_index.canonical(name) if isinstance(name, str) else ""
@@ -180,7 +241,7 @@ class PublishedData(unittest.TestCase):
 
     def test_mutations_are_rejected_with_the_wheel_named(self):
         data = json.loads(WHEELS.read_text(encoding="utf-8"))
-        sample = data["wheels"][0]
+        sample = next(w for w in data["wheels"] if w["target"].startswith("3.14"))  # the requires_python cases need 3.14
         cases = [
             ("missing key", lambda w: w.pop("sdist_sha256")),
             ("unusable", lambda w: w.update(sha256="invalid")),
@@ -195,6 +256,15 @@ class PublishedData(unittest.TestCase):
             ("bad date", lambda w: w.update(verified="2026-99-99")),
             ("date order", lambda w: w.update(published="2020-01-01")),
             ("recipes", lambda w: w.update(recipes=[{"library": "libyaml", "version": "0.2.5"}])),
+            ("python too new", lambda w: w.update(requires_python=">=3.99")),
+            ("python too old", lambda w: w.update(requires_python="<3.14")),
+            ("python compatible release", lambda w: w.update(requires_python="~=3.9.0")),
+            ("python wildcard", lambda w: w.update(requires_python="!=3.14.*")),
+            ("python one bad clause", lambda w: w.update(requires_python=">=3.9,<3.14")),
+            ("python number", lambda w: w.update(requires_python=42)),
+            ("python no operator", lambda w: w.update(requires_python="42")),
+            ("python words", lambda w: w.update(requires_python=">=three")),
+            ("python empty", lambda w: w.update(requires_python="")),
         ]
         for description, mutate in cases:
             with self.subTest(description=description):
@@ -205,6 +275,102 @@ class PublishedData(unittest.TestCase):
                 errors = validation_errors(changed, set())
                 self.assertTrue(errors, description)
                 self.assertTrue(any(str(entry["wheel"]) in error for error in errors), errors)
+                if description.startswith("python"):
+                    self.assertEqual(len(errors), 1, errors)
+                    self.assertIn("requires_python", errors[0])
+
+    def test_requires_python_must_admit_the_targets_own_python(self):
+        wheel = "demo-1.0-cp314-cp314-win_arm64.whl"
+        for target, value, expected in (
+            ("3.14 musl-aarch64", ">=3.15", "requires_python >=3.15 excludes Python 3.14, its target"),
+            ("3.14t win-arm64", "<3.14", "requires_python <3.14 excludes Python 3.14, its target"),
+            ("3.15 win-amd64", "<3.15", "requires_python <3.15 excludes Python 3.15, its target"),
+            ("3.15 win-amd64", ">=3.10, ==3.14.*", "requires_python ==3.14.* excludes Python 3.15, its target"),
+            ("3.13 linux-riscv64", ">=3.14", "requires_python >=3.14 excludes Python 3.13, its target"),  # retired
+            ("3.9 win-arm64", ">=3.10", "requires_python >=3.10 excludes Python 3.9, its target"),  # numbers, not text
+            ("3.14 win-arm64", ">=3.9,===3.14", "can't read requires_python '>=3.9,===3.14'"),
+            ("3.14 win-arm64", ">=3.14.0rc1", "can't read requires_python '>=3.14.0rc1'"),
+            ("3.14 win-arm64", ">=3.9,", "can't read requires_python '>=3.9,'"),
+            ("3.14 win-arm64", ">=3.*", "can't read requires_python '>=3.*'"),
+            ("3.14 win-arm64", "~=3", "can't read requires_python '~=3'"),
+            ("3.14 win-arm64", "  ", "requires_python must be null or a non-empty string, not '  '"),
+            ("3.14 win-arm64", [">=3.9"], "requires_python must be null or a non-empty string, not ['>=3.9']"),
+            ("not a target", ">=three", "can't read requires_python '>=three'"),
+        ):
+            with self.subTest(target=target, value=value):
+                self.assertEqual(requires_python_error(value, target), expected)
+                entry = {"wheel": wheel, "target": target, "requires_python": value}
+                errors = validation_errors({"schema": gap_wheels.INDEX_SCHEMA, "wheels": [entry]}, set())
+                self.assertIn(f"{wheel}: {expected}", errors)
+        for target, value in (
+            ("3.14 win-arm64", None),
+            ("3.14 win-arm64", ">=3.14"),
+            ("3.15 win-amd64", ">=3.15"),  # 3.15.0, as pip compares it, so an alpha of 3.15 is admitted
+            ("3.14t linux-x86_64", "<4,>=3.9"),
+            ("3.14 win-arm64", " >= 3.9 , < 4 "),
+            ("not a target", ">=3.99"),  # the target check reports this entry
+        ):
+            with self.subTest(target=target, value=value):
+                self.assertIsNone(requires_python_error(value, target))
+
+    def test_every_target_names_its_python(self):
+        for target in gap_wheels.PUBLISH_TAGS:
+            with self.subTest(target=target):
+                python = target_python(target)
+                self.assertIsNotNone(python)
+                self.assertEqual(f"{python[0]}.{python[1]}", target.split()[0].removesuffix("t"))
+                self.assertEqual(python[2], 0)
+        self.assertEqual(target_python("3.13 linux-riscv64"), (3, 13, 0))
+        self.assertIsNone(target_python("pypy3.11 win-arm64"))
+        self.assertIsNone(target_python(314))
+
+    def test_requires_python_clauses(self):
+        py314, py315 = (3, 14, 0), (3, 15, 0)
+        for value, python, excluded in (
+            (">=3.10", py314, None),
+            (">=3.10", py315, None),
+            ("<4.0.0,>=3.10.0", py314, None),
+            ("<4.0.0,>=3.10.0", py315, None),
+            ("==3.14.*", py314, None),
+            ("==3.14.*", py315, "==3.14.*"),
+            ("~=3.9", py314, None),  # >=3.9, ==3.*
+            ("~=3.9", (4, 0, 0), "~=3.9"),
+            ("~=3.9.0", py314, "~=3.9.0"),  # >=3.9.0, ==3.9.*
+            ("~=3.14.0", py314, None),
+            ("~=3.14.1", py314, "~=3.14.1"),
+            ("~=3.14.0", py315, "~=3.14.0"),
+            (">=3.9", py314, None),  # 3.9 is less than 3.14: numbers, not text
+            ("<3.9", py314, "<3.9"),
+            (">=3.14", py314, None),  # 3.14 is 3.14.0
+            (">=3.14.0", py314, None),
+            ("<=3.14", py314, None),
+            ("==3.14", py314, None),
+            ("==3.14.0.0", py314, None),
+            ("==3.14", (3, 14, 1), "==3.14"),
+            (">3.14", py314, ">3.14"),
+            (">3.14", py315, None),
+            ("<3.14", py314, "<3.14"),
+            ("<=3.13", py314, "<=3.13"),
+            (">=3.14.1", py314, ">=3.14.1"),
+            ("!=3.14", py314, "!=3.14"),
+            ("!=3.14.0", py314, "!=3.14.0"),
+            ("!=3.14.1", py314, None),
+            ("!=3.14.*", py314, "!=3.14.*"),
+            ("!=3.14.*", py315, None),
+            ("!=3.14.*", (3, 14, 1), "!=3.14.*"),  # every 3.14, not only 3.14.0
+            ("==3.14.*", (3, 14, 1), None),
+            ("!=3.1.*", py314, None),  # 3.1.* is not a text prefix match on 3.14
+            ("==3.*", py315, None),
+            (">=3.9, !=3.13.*, <3.15", py314, None),
+            (">=3.9, !=3.13.*, <3.15", py315, "<3.15"),
+            (">= 3.10", py314, None),
+        ):
+            with self.subTest(value=value, python=python):
+                self.assertEqual(excluding_clause(value, python), excluded)
+        for value in ("", "42", "3.14", ">=three", ">=3.x", "=>3.9", "===3.14", ">=3.14rc1", ">=3.14.dev0", "~=3",
+                      ">=3.*", "~=3.9.*", ">=3.9,", ",>=3.9", ">=3.9;<4", ">=3.9 <4", "==*", ">=\u0663.9"):  # fmt: skip
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                excluding_clause(value, py314)
 
 
 if __name__ == "__main__":

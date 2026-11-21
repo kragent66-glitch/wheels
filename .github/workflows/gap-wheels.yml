@@ -259,11 +259,19 @@ jobs:
         with:
           name: staged
           path: staged
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      # Each install-test result goes into a folder of its artifact's name (tested-<slug>/tested.json), which is how
+      # publish knows the target a result is for. download-artifact with a pattern puts a lone match straight into
+      # `path`, with no folder, so a batch with one target published nothing: download them one by one instead.
+      - name: Download the install-test results
         continue-on-error: true # no test results: nothing publishes
-        with:
-          pattern: tested-*
-          path: tested
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p tested
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate --jq '.artifacts[].name' \
+            | grep -E '^tested-[A-Za-z0-9._-]+$' | sort -u | while read -r name; do
+              gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$name" --dir "tested/$name" || true
+            done
       - id: choose
         name: Choose the wheels to publish and update the index
         env:

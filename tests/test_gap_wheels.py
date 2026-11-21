@@ -1026,6 +1026,145 @@ class InstallAndImport(unittest.TestCase):
                              "its native libraries didn't load")
 
 
+class WheelModules(unittest.TestCase):
+    """build_lab.wheel_modules and wheel_names read only a wheel's member names, so each case is a zip of empty
+    files. Together they decide what install_and_import imports before a wheel is published."""
+
+    def wheel(self, *members):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = Path(folder.name) / "demo-1.0-cp314-cp314-win_arm64.whl"
+        with zipfile.ZipFile(path, "w") as z:
+            for member in members:
+                z.writestr(member, "")
+        return path
+
+    def modules(self, *members):
+        return gap_wheels.build_lab.wheel_modules(self.wheel(*members))
+
+    def names(self, *members):
+        return gap_wheels.build_lab.wheel_names(self.wheel(*members))
+
+    def test_top_modules_are_the_three_shallowest_then_by_name(self):
+        # Written deepest first: the order comes from the helper, not from the zip.
+        got = self.modules("demo/sub/deep.py", "demo/sub/__init__.py", "demo/core.py", "demo/__init__.py")
+        self.assertEqual(got, (["demo", "demo.core", "demo.sub"], [], 0))
+        # A top-level module comes before anything inside a package, whatever its name.
+        self.assertEqual(self.modules("demo/__init__.py", "demo/core.py", "zeta.py")[0], ["demo", "zeta", "demo.core"])
+        self.assertEqual(self.modules("demo/__init__.py")[0], ["demo"])  # fewer than three is fine
+
+    def test_single_file_modules_and_packages_without_an_init(self):
+        # `ns` has no __init__.py (a namespace package): what it holds is named, `ns` itself isn't.
+        self.assertEqual(self.modules("six.py", "ns/pkg/__init__.py"), (["six", "ns.pkg"], [], 0))
+        self.assertEqual(self.modules("ns/pkg/mod.py"), (["ns.pkg.mod"], [], 0))
+        self.assertEqual(self.names("six.py", "ns/pkg/__init__.py", "ns/other/mod.py"),
+                         {"modules": ["ns.other.mod", "six"], "packages": ["ns.pkg"]})  # fmt: skip
+
+    def test_test_folders_are_left_out_but_their_extensions_are_counted(self):
+        got = self.modules(
+            "demo/__init__.py",
+            "demo/_real.abi3.so",
+            "demo/tests/__init__.py",
+            "demo/tests/test_core.py",
+            "demo/tests/_helper.cpython-314-x86_64-linux-gnu.so",
+            "demo/sub/test/_helper.cp314-win_arm64.pyd",
+            "tests/__init__.py",
+            "test/conftest.py",
+        )
+        self.assertEqual(got, (["demo", "demo._real"], ["demo._real"], 3))
+        # Only a folder named exactly `tests` or `test` counts: a module that merely starts with "test" is shipped.
+        got = self.modules("demo/__init__.py", "demo/testing.py", "demo/test_utils.cp314-win_arm64.pyd")
+        self.assertEqual(got, (["demo", "demo.test_utils", "demo.testing"], ["demo.test_utils"], 1))
+
+    def test_extension_modules_are_named_by_dotted_path_without_the_abi_tag(self):
+        got = self.modules(
+            "demo/__init__.py",
+            "demo/_a.cpython-314t-x86_64-linux-gnu.so",
+            "demo/_b.abi3.so",
+            "demo/_c.cp314-win_arm64.pyd",
+            "demo/libfoo.so",  # a plain shared library, loaded with ctypes
+            "demo/libz.so.1",
+            "demo.libs/libbar-1a2b3c4d.so.2",  # what auditwheel bundles
+        )
+        self.assertEqual(got, (["demo", "demo._a", "demo._b"], ["demo._a", "demo._b", "demo._c"], 3))
+        # The other spellings an extension module has: free-threaded abi3, an untagged .pyd, at the top level.
+        got = self.modules("_d.abi3t.so", "demo/_e.cp314t-win_arm64.pyd", "demo/_f.pyd")
+        self.assertEqual(got, (["_d", "demo._e", "demo._f"], ["_d", "demo._e", "demo._f"], 3))
+
+    def test_no_more_than_max_extensions_are_listed_but_all_are_counted(self):
+        limit = gap_wheels.build_lab.MAX_EXTENSIONS
+        top, extensions, count = self.modules(*(f"demo/_m{n:03}.abi3.so" for n in range(limit + 5)))
+        self.assertEqual(extensions, [f"demo._m{n:03}" for n in range(limit)])
+        self.assertEqual(count, limit + 5)
+        self.assertEqual(top, ["demo._m000", "demo._m001", "demo._m002"])
+
+    def test_dist_info_and_data_folders_are_ignored_by_both(self):
+        inside = [
+            "demo-1.0.dist-info/METADATA",
+            "demo-1.0.dist-info/top_level.py",
+            "demo-1.0.dist-info/_x.abi3.so",
+            "demo-1.0.data/purelib/extra.py",
+            "demo-1.0.data/platlib/_speed.cp314-win_arm64.pyd",
+            "demo-1.0.data/scripts/run.py",
+        ]
+        self.assertEqual(self.modules(*inside), ([], [], 0))
+        self.assertEqual(self.names(*inside), {"modules": [], "packages": []})
+        self.assertEqual(self.modules("demo/__init__.py", *inside), (["demo"], [], 0))
+        self.assertEqual(self.names("demo/__init__.py", *inside), {"modules": [], "packages": ["demo"]})
+        # `demo-1.0.data` could never be a dotted name anyway (the hyphen). A folder with no version shows it is the
+        # `.dist-info` or `.data` ending that leaves these out, not that.
+        bare = ["demo.data/purelib/extra.py", "demo.data/platlib/_speed.abi3.so", "demo.dist-info/hook.py",
+                "demo.dist-info/__init__.py"]  # fmt: skip
+        self.assertEqual(self.modules("demo/__init__.py", *bare), (["demo"], [], 0))
+        self.assertEqual(self.names("demo/__init__.py", *bare), {"modules": [], "packages": ["demo"]})
+
+    def test_a_folder_with_a_dot_in_its_name_reads_as_two_packages(self):
+        # Pinned as it is today, and probably wrong: `demo/x.data/y.py` can't be imported as demo.x.data.y. The
+        # name is checked after the parts are joined with dots, so a dot inside one part passes. Only the wheel's
+        # top folder is checked for `.dist-info` and `.data`.
+        self.assertEqual(self.modules("demo/__init__.py", "demo/x.data/y.py"), (["demo", "demo.x.data.y"], [], 0))
+        self.assertEqual(self.names("demo/__init__.py", "demo/x.data/y.py"),
+                         {"modules": ["demo.x.data.y"], "packages": ["demo"]})  # fmt: skip
+
+    def test_names_that_arent_dotted_identifiers_are_left_out(self):
+        odd = ["demo/my-module.py", "demo/2fast.py", "my-pkg/__init__.py", "my-pkg/mod.py", "demo/_h-x.abi3.so",
+               "demo/caf\u00e9.py"]  # fmt: skip
+        self.assertEqual(self.modules("demo/__init__.py", "demo/ok.py", *odd), (["demo", "demo.ok"], [], 0))
+        self.assertEqual(self.names("demo/__init__.py", "demo/ok.py", *odd),
+                         {"modules": ["demo.ok"], "packages": ["demo"]})  # fmt: skip
+
+    def test_a_top_level_init_adds_no_empty_name(self):
+        self.assertEqual(self.modules("__init__.py"), ([], [], 0))
+        self.assertEqual(self.names("__init__.py"), {"modules": [], "packages": []})
+
+    def test_wheel_names_lists_every_module_and_regular_package(self):
+        got = self.names(
+            "__init__.py",
+            "six.py",
+            "demo/__init__.py",
+            "demo/core.py",
+            "demo/sub/__init__.py",
+            "demo/sub/deep.py",
+            "demo/_a.cpython-314t-x86_64-linux-gnu.so",
+            "demo/_b.abi3.so",
+            "demo/_c.cp314-win_arm64.pyd",
+            "demo/libfoo.so",  # counts here, though wheel_modules doesn't import it: any .so is the wheel's own
+            "demo/libz.so.1",  # but not a versioned one
+            "demo/data.json",
+            "demo/tests/__init__.py",  # tests are the wheel's own modules too
+            "demo/tests/test_core.py",
+            "ns/plugin/mod.py",  # `ns` and `ns.plugin` have no __init__.py, so they aren't regular packages
+            "demo/my-module.py",
+            "demo-1.0.dist-info/RECORD",
+            "demo-1.0.data/purelib/extra.py",
+        )
+        self.assertEqual(got, {
+            "modules": ["demo._a", "demo._b", "demo._c", "demo.core", "demo.libfoo", "demo.sub.deep",
+                        "demo.tests.test_core", "ns.plugin.mod", "six"],
+            "packages": ["demo", "demo.sub", "demo.tests"],
+        })  # fmt: skip
+
+
 def pe(dlls, delay=(), machine=0xAA64):
     """A minimal PE32+ file for `machine` (ARM64 by default) importing `dlls` (and delay-loading `delay`): what
     pe_info reads, nothing more."""
