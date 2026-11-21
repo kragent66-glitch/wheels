@@ -1,3 +1,4 @@
+import html
 import http.client
 import json
 import re
@@ -29,6 +30,18 @@ def pypi_file(filename, **over):
          "core-metadata": {"sha256": META_SHA}, "data-dist-info-metadata": {"sha256": META_SHA}}  # fmt: skip
     f.update(over)
     return f
+
+
+OURS = "releases/download/gap-wheels/"
+ANCHOR = re.compile(r"<a\s([^>]*)>")
+ATTRIBUTE = re.compile(r'([a-z-]+)="([^"]*)"')
+
+
+def simple_links(page):
+    """Each link of a simple index page as a dict of its attributes, unescaped (so `href` is the URL an installer
+    fetches). Read back from the HTML with regexes of its own, not with build_gap_index's formatting code."""
+    return [{name: html.unescape(value) for name, value in ATTRIBUTE.findall(attrs)}
+            for attrs in ANCHOR.findall(page.read_text(encoding="utf-8"))]  # fmt: skip
 
 
 def no_network(project):
@@ -113,27 +126,139 @@ class FileNames(unittest.TestCase):
 class Index(unittest.TestCase):
     def build(self, wheels, pypi=None, expect=0, sdists=True, requests=None, **kw):
         """Build with a fake PyPI. Unless `sdists` is false, PyPI also lists each wheel's release (its sdist), as it
-        does for every release we build from. `requests` is written as data/gap-wheel-requests.json."""
+        does for every release we build from; `sdists` can also be a set of project names to leave without theirs.
+        `requests` is written as data/gap-wheel-requests.json."""
         tmp = Path(tempfile.mkdtemp())
         (tmp / "gap-wheels.json").write_text(json.dumps({"schema": 1, "wheels": wheels}))
         if requests is not None:
             (tmp / "gap-wheel-requests.json").write_text(json.dumps(requests))
         self.fetched = []
+        self.pypi_listed = {}
 
         def fetch(project):
             self.fetched.append(project)
             files = list((pypi or {}).get(project, []))
-            if sdists:
+            if sdists and (sdists is True or project not in sdists):
                 for w in wheels:
                     if build_gap_index.canonical(w["name"]) == project:
                         name, version = w["wheel"].split("-")[:2]
                         if not any(f.get("filename") == f"{name}-{version}.tar.gz" for f in files if isinstance(f, dict)):
                             files.append(pypi_file(f"{name}-{version}.tar.gz"))
+            self.pypi_listed[project] = [f.get("filename") for f in files if isinstance(f, dict)]
             return files
 
         got = build_gap_index.build(tmp / "gap-wheels.json", tmp / "site", fetch=fetch, **kw)
         self.assertEqual(got, expect)
         return tmp / "site"
+
+    def assert_status_matches_index(self, site, pypi_listed=None):
+        """data/status.json (what programs read) and the simple pages (what pip and uv read) describe the same
+        decisions: every wheel status.json calls in-index or yanked is linked exactly once from its project's page,
+        nothing else of ours is linked anywhere, and the human page counts the same wheels. `pypi_listed` is the
+        file names the fake PyPI gave for each project, by default those of the last self.build()."""
+        pypi_listed = self.pypi_listed if pypi_listed is None else pypi_listed
+        simple = site / "simple"
+        rows = json.loads((site / "data/status.json").read_text(encoding="utf-8"))["wheels"]
+        known = {"in-index", "yanked", "withdrawn-pypi-has-wheel", "withdrawn-release-gone", "left-out-pypi-unreadable"}
+        root = [link["href"] for link in simple_links(simple / "index.html")]
+        expected: dict[str, set[str]] = {}  # project -> the links to our release its page should have
+        for row in rows:
+            project, name, state = row["project"], row["wheel"], row["status"]
+            where = f"{project}: {name} ({state})"
+            self.assertIn(state, known, where)
+            self.assertEqual(row["url"], build_gap_index.RELEASE_URL + name, where)
+            page = simple / project / "index.html"
+            if state == "left-out-pypi-unreadable":
+                self.assertFalse((simple / project).exists(), f"{where}: its project has a simple/ folder")
+                self.assertNotIn(f"{project}/", root, f"{where}: its project is on simple/index.html")
+                self.assertIsNone(row["yank_reason"], where)
+                continue
+            self.assertTrue(page.is_file(), f"{where}: its project has no simple page")
+            self.assertEqual(root.count(f"{project}/"), 1, f"{where}: its project isn't once on simple/index.html")
+            links = simple_links(page)
+            mine = [link for link in links if link["href"].split("#")[0] == row["url"]]
+            if state in ("in-index", "yanked"):
+                self.assertEqual([link["href"] for link in mine], [f"{row['url']}#sha256={row['sha256']}"],
+                                 f"{where}: not linked exactly once, with its hash")  # fmt: skip
+                expected.setdefault(project, set()).add(mine[0]["href"])
+                if state == "yanked":
+                    self.assertIsInstance(row["yank_reason"], str, where)
+                    self.assertEqual(mine[0].get("data-yanked"), row["yank_reason"], f"{where}: data-yanked differs")
+                else:
+                    self.assertIsNone(row["yank_reason"], where)
+                    self.assertNotIn("data-yanked", mine[0], f"{where}: its link is marked yanked")
+            else:
+                self.assertEqual(mine, [], f"{where}: still linked from its project's page")
+                self.assertIsNone(row["yank_reason"], where)
+                # The page is still PyPI's list for the project: each file PyPI gave, from PyPI's own host.
+                theirs = sorted(link["href"].split("#")[0].rsplit("/", 1)[1] for link in links
+                                if link["href"].startswith(build_gap_index.PYPI_FILES))  # fmt: skip
+                self.assertEqual(theirs, sorted(pypi_listed[project]), f"{where}: PyPI's files aren't all listed")
+        # No link to our release is left over: each one on any simple page belongs to an in-index or yanked row.
+        self.assertEqual(sorted(f"{p.name}/" for p in simple.iterdir() if p.is_dir()), sorted(root))
+        for page in simple.glob("*/index.html"):
+            ours = sorted(link["href"] for link in simple_links(page) if OURS in link["href"])
+            self.assertEqual(ours, sorted(expected.get(page.parent.name, ())), f"{page.parent.name}: a link without a row")
+        self.assertEqual([link["href"] for link in simple_links(simple / "index.html") if OURS in link["href"]], [])
+        listed = sum(len(links) for links in expected.values())
+        human = (site / "index.html").read_text(encoding="utf-8")
+        self.assertEqual(re.findall(r"(\d+) so far", human), [str(listed)])
+
+    def test_status_json_and_the_simple_index_agree_when_one_build_mixes_every_status(self):
+        t314 = "tiktoken-0.14.0-cp314-cp314t-win_arm64.whl"
+        lz4_old, lz4_new = "lz4-4.4.4-cp314-cp314-win_arm64.whl", "lz4-4.4.5-cp314-cp314-win_arm64.whl"
+        wheels = [
+            wheel(),  # in-index
+            wheel(file=t314, target="3.14t win-arm64", sha256="1" * 64),  # PyPI has this one now
+            wheel(name="lz4", file=lz4_old, version="4.4.4", sha256="2" * 64),  # in-index, beside a yanked release
+            wheel(name="lz4", file=lz4_new, version="4.4.5", sha256="3" * 64),  # yanked, with a reason to escape
+            wheel(name="regex", file="regex-2026.1.1-cp314-cp314-win_arm64.whl", version="2026.1.1", sha256="4" * 64),
+            wheel(name="zstandard", file="zstandard-0.25.0-cp314-cp314-win_arm64.whl", version="0.25.0", sha256="5" * 64),
+            wheel(name="Zope.Interface", file="zope_interface-8.7-cp314-cp314-win_arm64.whl", version="8.7", sha256="6" * 64),
+            wheel(name="broken", file="broken-1.0-cp314-cp314-win_arm64.whl", version="1.0", sha256="7" * 64),
+            wheel(name="broken", file="broken-1.0-cp314-cp314t-win_arm64.whl", version="1.0", sha256="8" * 64),
+        ]  # fmt: skip
+        pypi = {
+            "tiktoken": [pypi_file(t314)],
+            "lz4": [pypi_file("lz4-4.4.5.tar.gz", yanked='bad "build" <1>')],
+            "regex": [pypi_file("regex-2026.1.1.tar.gz", yanked=True)],  # yanked without a reason
+            "zstandard": [pypi_file("zstandard-0.26.0.tar.gz")],  # the release ours was built from is gone
+            "zope-interface": [pypi_file("zope.interface-8.7-cp314-cp314-win_arm64.whl")],  # PyPI's spelling of ours
+            "broken": [pypi_file("broken-1.0.tar.gz", url="https://untrusted.example/broken-1.0.tar.gz")],
+        }
+        site = self.build(wheels, pypi, sdists={"zstandard"}, omit_failing=True)
+        self.assert_status_matches_index(site)
+        rows = json.loads((site / "data/status.json").read_text(encoding="utf-8"))["wheels"]
+        self.assertEqual(
+            [(row["project"], row["wheel"], row["status"], row["yank_reason"]) for row in rows],
+            [
+                ("broken", "broken-1.0-cp314-cp314-win_arm64.whl", "left-out-pypi-unreadable", None),
+                ("broken", "broken-1.0-cp314-cp314t-win_arm64.whl", "left-out-pypi-unreadable", None),
+                ("lz4", lz4_old, "in-index", None),
+                ("lz4", lz4_new, "yanked", 'bad "build" <1>'),
+                ("regex", "regex-2026.1.1-cp314-cp314-win_arm64.whl", "yanked", ""),
+                ("tiktoken", "tiktoken-0.14.0-cp314-cp314-win_arm64.whl", "in-index", None),
+                ("tiktoken", t314, "withdrawn-pypi-has-wheel", None),
+                ("zope-interface", "zope_interface-8.7-cp314-cp314-win_arm64.whl", "withdrawn-pypi-has-wheel", None),
+                ("zstandard", "zstandard-0.25.0-cp314-cp314-win_arm64.whl", "withdrawn-release-gone", None),
+            ],
+        )  # every status is there, so the helper had each kind of row to check
+        self.assertIn("4 so far", (site / "index.html").read_text(encoding="utf-8"))
+        self.assertEqual(sorted(p.name for p in (site / "simple").iterdir()),
+                         ["index.html", "lz4", "regex", "tiktoken", "zope-interface", "zstandard"])  # fmt: skip
+
+    def test_the_status_helper_reads_links_as_an_installer_would(self):
+        folder = Path(tempfile.mkdtemp())
+        (folder / "index.html").write_text(
+            '<a href="https://example.test/a&amp;b.whl#sha256=00" data-yanked="">a</a><br>\n'
+            '<a href="https://example.test/c.whl#sha256=11" data-requires-python="&gt;=3.9" '
+            'data-yanked="a &quot;b&quot; &lt;c&gt;">c</a>\n<a href="d/">d</a>', encoding="utf-8")  # fmt: skip
+        self.assertEqual(simple_links(folder / "index.html"), [
+            {"href": "https://example.test/a&b.whl#sha256=00", "data-yanked": ""},
+            {"href": "https://example.test/c.whl#sha256=11", "data-requires-python": ">=3.9",
+             "data-yanked": 'a "b" <c>'},
+            {"href": "d/"},
+        ])  # fmt: skip
 
     def test_pep_503_pages_with_hashes(self):
         site = self.build([wheel(), wheel(name="Zope.Interface", file="zope_interface-8.7-cp314-cp314-win_arm64.whl")])
@@ -265,6 +390,7 @@ class Index(unittest.TestCase):
     def test_the_same_file_recorded_twice_keeps_each_projects_state(self):
         # tiktoken sorts before tiktokn, so tiktokn's withdrawal used to overwrite tiktoken's in-index state.
         site = self.build([wheel(), wheel(name="tiktokn")])
+        self.assert_status_matches_index(site)
         status = json.loads((site / "data/status.json").read_text(encoding="utf-8"))
         self.assertEqual(
             [(w["project"], w["status"]) for w in status["wheels"]],
@@ -283,6 +409,7 @@ class Index(unittest.TestCase):
             [wheel(name="tiktok"), wheel()],
             {"tiktok": [pypi_file("tiktok-0.14.0-cp314-cp314-win_arm64.whl", yanked="bad build")]},
         )
+        self.assert_status_matches_index(site)
         status = json.loads((site / "data/status.json").read_text(encoding="utf-8"))
         self.assertEqual(
             [(w["project"], w["status"], w["yank_reason"]) for w in status["wheels"]],
@@ -492,6 +619,7 @@ class Index(unittest.TestCase):
             wheel(),
         ]
         site = self.build(wheels)
+        self.assert_status_matches_index(site)
         status = json.loads((site / "data/status.json").read_text(encoding="utf-8"))
         self.assertEqual(status["schema"], 1)
         self.assertEqual(status["index"], build_gap_index.INDEX_URL)
@@ -515,6 +643,7 @@ class Index(unittest.TestCase):
         for reason, expected in (("broken release", "broken release"), (True, "")):
             with self.subTest(reason=reason):
                 site = self.build([wheel()], {"tiktoken": [pypi_file(source, yanked=reason)]})
+                self.assert_status_matches_index(site)
                 entry = json.loads((site / "data/status.json").read_text())["wheels"][0]
                 self.assertEqual(entry["status"], "yanked")
                 self.assertEqual(entry["yank_reason"], expected)
@@ -524,6 +653,7 @@ class Index(unittest.TestCase):
     def test_status_json_withdrawn_when_pypi_has_matching_wheel(self):
         filename = "tiktoken-0.14.0-cp314-cp314-win_arm64.whl"
         site = self.build([wheel()], {"tiktoken": [pypi_file(filename)]})
+        self.assert_status_matches_index(site)
         entry = json.loads((site / "data/status.json").read_text())["wheels"][0]
         self.assertEqual(entry["status"], "withdrawn-pypi-has-wheel")
         self.assertIsNone(entry["yank_reason"])
@@ -531,6 +661,7 @@ class Index(unittest.TestCase):
 
     def test_status_json_withdrawn_when_release_is_gone(self):
         site = self.build([wheel()], sdists=False)
+        self.assert_status_matches_index(site)
         entry = json.loads((site / "data/status.json").read_text())["wheels"][0]
         self.assertEqual(entry["status"], "withdrawn-release-gone")
         self.assertIsNone(entry["yank_reason"])
@@ -539,6 +670,7 @@ class Index(unittest.TestCase):
     def test_status_json_marks_unreadable_pypi_only_for_explicit_omit(self):
         bad = pypi_file("tiktoken-0.14.0.tar.gz", url="https://untrusted.example/sdist.tar.gz")
         site = self.build([wheel()], {"tiktoken": [bad]}, omit_failing=True)
+        self.assert_status_matches_index(site)
         entry = json.loads((site / "data/status.json").read_text())["wheels"][0]
         self.assertEqual(entry["status"], "left-out-pypi-unreadable")
         self.assertIsNone(entry["yank_reason"])
@@ -550,7 +682,9 @@ class Index(unittest.TestCase):
 
     def test_status_json_is_identical_for_identical_inputs(self):
         wheels = [wheel()]
-        a = (self.build(wheels) / "data/status.json").read_bytes()
+        site = self.build(wheels)
+        self.assert_status_matches_index(site)
+        a = (site / "data/status.json").read_bytes()
         b = (self.build(wheels) / "data/status.json").read_bytes()
         self.assertEqual(a, b)
         self.assertTrue(a.endswith(b"\n"))
@@ -559,6 +693,7 @@ class Index(unittest.TestCase):
     def test_status_json_keeps_yank_reasons_across_projects(self):
         wheels = [wheel(), wheel(name="lz4", file="lz4-4.4.5-cp314-cp314-win_arm64.whl", version="4.4.5")]
         site = self.build(wheels, {"lz4": [pypi_file("lz4-4.4.5.tar.gz", yanked="bad build")]})
+        self.assert_status_matches_index(site)
         rows = {row["project"]: row for row in json.loads((site / "data/status.json").read_text())["wheels"]}
         self.assertEqual((rows["lz4"]["status"], rows["lz4"]["yank_reason"]), ("yanked", "bad build"))
         self.assertEqual((rows["tiktoken"]["status"], rows["tiktoken"]["yank_reason"]), ("in-index", None))
@@ -567,11 +702,13 @@ class Index(unittest.TestCase):
         odd = wheel(target=3)
         del odd["version"]
         site = self.build([odd])
+        self.assert_status_matches_index(site)
         row = json.loads((site / "data/status.json").read_text())["wheels"][0]
         self.assertEqual((row["version"], row["target"], row["status"]), (None, None, "in-index"))
 
     def test_status_json_omits_entries_the_index_rejects(self):
         site = self.build([wheel(), wheel(name="../unsafe"), wheel(sha256="invalid")])
+        self.assert_status_matches_index(site)
         rows = json.loads((site / "data/status.json").read_text())["wheels"]
         self.assertEqual([row["wheel"] for row in rows], [wheel()["wheel"]])
 
