@@ -2472,12 +2472,16 @@ def cmd_install_test(args: argparse.Namespace) -> int:
     return 0
 
 
-def read_tested(folder: Path) -> dict[str, dict[str, bool]]:
+def read_tested(folder: Path) -> tuple[dict[str, dict[str, bool]], dict[str, set[str]]]:
     """By target: {wheel: passed} from the untrusted install-test artifacts. Each answer counts only for the target its
     artifact is named for (tested-<slug>/tested.json, the slug of a lab target), whatever target its JSON names, so a
-    test job can't answer for another target by writing that target's name into its own artifact."""
+    test job can't answer for another target by writing that target's name into its own artifact.
+
+    With it, for the summary's wording only (nothing publishes because of it): by target whose artifact was read, the
+    wheels it answered `false` for. A target missing from this second dict had no readable result at all."""
     slugs = {t.replace(" ", "-"): t for t in build_lab.TARGETS}
     out: dict[str, dict[str, bool]] = {}
+    failed: dict[str, set[str]] = {}
     paths = sorted(folder.glob("tested-*/tested.json")) if folder.is_dir() else []
     for path in paths:
         target = slugs.get(path.parent.name.removeprefix("tested-"))
@@ -2490,14 +2494,29 @@ def read_tested(folder: Path) -> dict[str, dict[str, bool]]:
         if not isinstance(data, dict) or not isinstance(data.get("tested"), dict):
             continue
         out[target] = {k: v for k, v in data["tested"].items() if isinstance(k, str) and v is True}
-    return out
+        failed[target] = {k for k, v in data["tested"].items() if isinstance(k, str) and v is False}
+    return out, failed
+
+
+NO_RESULT = "no install-test result"
+
+
+def why_untested(name: str, target: str, failed: dict[str, set[str]]) -> str:
+    """What to say about a staged wheel whose install test didn't pass. `name` and `target` are the staging job's;
+    nothing from a tested.json is put into the text."""
+    if target not in failed:
+        return f"{NO_RESULT} for {target} (the test job didn't finish or its result couldn't be read)"
+    if name in failed[target]:
+        return "failed the install test on a fresh runner"
+    return f"the install test for {target} gave no answer for it"
 
 
 def select(staged: list[dict], tested: dict[str, dict[str, bool]], folder: Path,
-           published: dict[str, dict]) -> tuple[list[dict], list[str]]:  # fmt: skip
+           published: dict[str, dict], failed: dict[str, set[str]]) -> tuple[list[dict], list[str]]:  # fmt: skip
     """(entries to publish now, a line saying what happened to each staged wheel). `staged` is the staging job's own
     output, the only thing trusted here: a wheel publishes when its file in `folder` has that sha256 and its
-    target's install test passed. A filename already published keeps its first bytes."""
+    target's install test passed. A filename already published keeps its first bytes. `failed` (read_tested's second
+    value) only picks the words for a wheel `tested` has no pass for."""
     new, lines = [], []
     for w in staged:
         name = w["wheel"]
@@ -2509,7 +2528,7 @@ def select(staged: list[dict], tested: dict[str, dict[str, bool]], folder: Path,
         elif not path.is_file() or path.is_symlink() or sha256(path) != w["sha256"]:
             lines.append(f"{name}: the staged file isn't the verified one; not published")
         elif not tested.get(w["target"], {}).get(name):
-            lines.append(f"{name}: didn't pass the install test on a fresh runner; not published")
+            lines.append(f"{name}: {why_untested(name, w['target'], failed)}; not published")
         elif name in published:
             same = published[name].get("sha256") == w["sha256"]
             lines.append(f"{name}: {'already published' if same else 'published before with other bytes; kept those'}")
@@ -2558,7 +2577,8 @@ def cmd_publish(args: argparse.Namespace) -> int:
     index_path = Path(args.index)
     index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.is_file() else {"schema": INDEX_SCHEMA, "wheels": []}
     published = {w["wheel"]: w for w in index["wheels"]}
-    new, lines = select(staged, read_tested(Path(args.tested)), staged_dir, published)
+    tested, failed = read_tested(Path(args.tested))
+    new, lines = select(staged, tested, staged_dir, published, failed)
     release = Path(args.release_dir)
     release.mkdir(parents=True, exist_ok=True)
     today = dt.datetime.now(dt.UTC).date().isoformat()
@@ -2573,6 +2593,8 @@ def cmd_publish(args: argparse.Namespace) -> int:
     index_path.write_text(json.dumps(index, indent=1) + "\n", encoding="utf-8")
     lines += [f"{n}: withdrawn (the project opted out)" for n in withdrawn]
     text = f"**{len(new)} published**, {len(index['wheels'])} in the index\n\n" + "".join(f"- {ln}\n" for ln in lines)
+    if (missing := sum(f": {NO_RESULT} for " in ln for ln in lines)) > 1:
+        text = f"{missing} wheels have {NO_RESULT}: re-run the failed install-test jobs, then this job.\n\n" + text
     print(text)
     if args.summary:
         with open(args.summary, "a", encoding="utf-8") as f:

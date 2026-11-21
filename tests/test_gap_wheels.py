@@ -905,6 +905,21 @@ class Publish(unittest.TestCase):
         gap_wheels.cmd_publish(args)
         return json.loads((tmp / "index.json").read_text())
 
+    def summary(self, tmp, staged):
+        """What a publish of `staged` writes to the job summary, and the wheels it published."""
+        (tmp / "summary.md").unlink(missing_ok=True)
+        args = gap_wheels.main.__globals__["argparse"].Namespace(
+            staged_json=json.dumps(staged), files=str(tmp / "files"), tested=str(tmp / "tested"),
+            index=str(tmp / "index.json"), release_dir=str(tmp / "release"), optout=str(tmp / "none"),
+            run="RUN", summary=str(tmp / "summary.md"))  # fmt: skip
+        gap_wheels.cmd_publish(args)
+        index = json.loads((tmp / "index.json").read_text())
+        return (tmp / "summary.md").read_text(), [w["wheel"] for w in index["wheels"]]
+
+    def artifact(self, tmp, text, slug="3.14-win-arm64"):
+        (tmp / "tested" / f"tested-{slug}").mkdir(parents=True, exist_ok=True)
+        (tmp / "tested" / f"tested-{slug}" / "tested.json").write_bytes(text.encode() if isinstance(text, str) else text)
+
     def test_a_tested_verified_wheel_publishes(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -945,7 +960,141 @@ class Publish(unittest.TestCase):
             self.mark_tested(tmp, target="3.14 musl-aarch64", slug="3.14-musl-aarch64")
             self.mark_tested(tmp, slug="forged")
             self.assertEqual(gap_wheels.read_tested(tmp / "tested"),
-                             {"3.14 win-arm64": {WIN: True}, "3.14 musl-aarch64": {WIN: True}})  # fmt: skip
+                             ({"3.14 win-arm64": {WIN: True}, "3.14 musl-aarch64": {WIN: True}},
+                              {"3.14 win-arm64": set(), "3.14 musl-aarch64": set()}))  # fmt: skip
+
+    def test_a_false_answer_is_kept_apart_from_the_passes_and_a_non_bool_is_dropped(self):
+        answers = {"passed.whl": True, "failed.whl": False, "word.whl": "yes", "one.whl": 1, "zero.whl": 0,
+                   "none.whl": None, "list.whl": [True], "dict.whl": {"ok": True}}  # fmt: skip
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            self.artifact(tmp, json.dumps({"target": "3.14 win-arm64", "tested": answers}))
+            self.artifact(tmp, json.dumps({"tested": {"other.whl": False}}), slug="3.14t-win-arm64")
+            self.artifact(tmp, json.dumps({"tested": {"forged.whl": False}}), slug="forged")
+            self.assertEqual(gap_wheels.read_tested(tmp / "tested"),
+                             ({"3.14 win-arm64": {"passed.whl": True}, "3.14t win-arm64": {}},
+                              {"3.14 win-arm64": {"failed.whl"}, "3.14t win-arm64": {"other.whl"}}))  # fmt: skip
+        self.assertEqual(gap_wheels.read_tested(Path(tmp) / "gone"), ({}, {}))
+
+    def test_select_says_which_of_the_four_things_happened_and_only_a_pass_publishes(self):
+        target = "3.14 win-arm64"
+        no_result = (f"{WIN}: no install-test result for 3.14 win-arm64 (the test job didn't finish or its result "
+                     "couldn't be read); not published")  # fmt: skip
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            w = self.staged(tmp)
+            for case, tested, failed, published, line in (
+                ("passed", {target: {WIN: True}}, {target: set()}, [w], f"{WIN}: published"),
+                ("failed", {target: {}}, {target: {WIN}}, [],
+                 f"{WIN}: failed the install test on a fresh runner; not published"),
+                ("no artifact for the target", {}, {}, [], no_result),
+                ("only another target's artifact", {"3.14t win-arm64": {WIN: True}}, {"3.14t win-arm64": set()}, [],
+                 no_result),
+                ("an artifact that doesn't mention it", {target: {"other.whl": True}}, {target: {"another.whl"}}, [],
+                 f"{WIN}: the install test for 3.14 win-arm64 gave no answer for it; not published"),
+                # The second dict never publishes anything, whatever it holds.
+                ("no pass, and nothing else agrees", {}, {"3.14t win-arm64": {WIN}}, [], no_result),
+            ):  # fmt: skip
+                with self.subTest(case):
+                    self.assertEqual(gap_wheels.select([w], tested, tmp / "files", {}, failed), (published, [line]))
+
+    def test_the_summary_line_for_each_kind_of_install_test_artifact(self):
+        ok = json.dumps({"target": "3.14 win-arm64", "tested": {WIN: True}})
+        no_result = (f"- {WIN}: no install-test result for 3.14 win-arm64 (the test job didn't finish or its result "
+                     "couldn't be read); not published\n")  # fmt: skip
+        no_answer = f"- {WIN}: the install test for 3.14 win-arm64 gave no answer for it; not published\n"
+        failed = f"- {WIN}: failed the install test on a fresh runner; not published\n"
+        cases = {  # what the test job left -> (does the wheel publish, as on main; its line)
+            "true": (lambda t: self.artifact(t, ok), True, f"- {WIN}: published\n"),
+            "true, naming another target inside": (
+                lambda t: self.artifact(t, json.dumps({"target": "3.14t win-arm64", "tested": {WIN: True}})),
+                True, f"- {WIN}: published\n"),
+            "false": (lambda t: self.artifact(t, json.dumps({"tested": {WIN: False}})), False, failed),
+            "nothing": (lambda t: None, False, no_result),
+            "an empty folder": (lambda t: (t / "tested" / "tested-3.14-win-arm64").mkdir(parents=True), False, no_result),
+            "true in another target's artifact": (lambda t: self.artifact(t, ok, slug="3.14t-win-arm64"), False, no_result),
+            "true in an artifact for no target": (lambda t: self.artifact(t, ok, slug="forged"), False, no_result),
+            "not JSON": (lambda t: self.artifact(t, ok[:-1]), False, no_result),
+            "not UTF-8": (lambda t: self.artifact(t, ok.encode() + b" \xff"), False, no_result),
+            "a list": (lambda t: self.artifact(t, json.dumps([{"tested": {WIN: True}}])), False, no_result),
+            "answers that aren't a dict": (lambda t: self.artifact(t, json.dumps({"tested": [WIN]})), False, no_result),
+            "no answers key": (lambda t: self.artifact(t, json.dumps({WIN: True})), False, no_result),
+            "oversized": (lambda t: self.artifact(t, ok + " " * gap_wheels.MAX_TESTED_BYTES), False, no_result),
+            "a symlinked tested.json": (lambda t: self.link_file(t, ok), False, no_result),
+            "a symlinked folder": (lambda t: self.link_folder(t, ok), False, no_result),
+            "another wheel only": (lambda t: self.artifact(t, json.dumps({"tested": {MUSL: True}})), False, no_answer),
+            "no wheels": (lambda t: self.artifact(t, json.dumps({"tested": {}})), False, no_answer),
+            **{f"the non-bool {value!r}": (
+                lambda t, value=value: self.artifact(t, json.dumps({"tested": {WIN: value}})), False, no_answer)
+               for value in ("yes", "true", 1, 0, 1.0, None, [True], {"ok": True})},
+        }  # fmt: skip
+        for case, (leave, publishes, line) in cases.items():
+            with self.subTest(case), tempfile.TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                w = self.staged(tmp)
+                leave(tmp)
+                text, published = self.summary(tmp, [w])
+                self.assertEqual(published, [WIN] if publishes else [])
+                self.assertEqual((tmp / "release" / WIN).exists(), publishes)
+                self.assertEqual(text, f"**{int(publishes)} published**, {int(publishes)} in the index\n\n{line}")
+
+    def link_file(self, tmp, text):
+        (tmp / "elsewhere.json").write_text(text)
+        (tmp / "tested" / "tested-3.14-win-arm64").mkdir(parents=True)
+        (tmp / "tested" / "tested-3.14-win-arm64" / "tested.json").symlink_to(tmp / "elsewhere.json")
+
+    def link_folder(self, tmp, text):
+        (tmp / "elsewhere").mkdir()
+        (tmp / "elsewhere" / "tested.json").write_text(text)
+        (tmp / "tested").mkdir()
+        (tmp / "tested" / "tested-3.14-win-arm64").symlink_to(tmp / "elsewhere", target_is_directory=True)
+
+    def test_nothing_from_a_tested_json_reaches_the_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            w = self.staged(tmp)
+            self.artifact(tmp, json.dumps({"target": "<b>INJECTED-TARGET</b>", "note": "INJECTED-NOTE",
+                                           "tested": {WIN: "INJECTED-ANSWER", "INJECTED-NAME.whl": False,
+                                                      "[INJECTED-LINK](https://example.invalid)": True}}))  # fmt: skip
+            text, published = self.summary(tmp, [w])
+        self.assertEqual(published, [])
+        self.assertNotIn("INJECTED", text)
+        self.assertEqual(text, "**0 published**, 0 in the index\n\n"
+                               f"- {WIN}: the install test for 3.14 win-arm64 gave no answer for it; not published\n")  # fmt: skip
+
+    def test_the_top_line_counts_the_wheels_with_no_install_test_result(self):
+        top = "{} wheels have no install-test result: re-run the failed install-test jobs, then this job.\n\n"
+        staged = []
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "files").mkdir()
+            for name, wheel, target in (("tiktoken", WIN, "3.14 win-arm64"), ("lz4", MUSL, "3.14 musl-aarch64"),
+                                        ("lz4", GLIBC_T, "3.14t linux-x86_64"),
+                                        ("zstandard", "zstandard-0.14.0-cp314-cp314-win_arm64.whl", "3.14 win-arm64")):  # fmt: skip
+                (tmp / "files" / wheel).write_bytes(wheel.encode())
+                staged.append({**verified(name=name, wheel=wheel, target=target,
+                                          sha=hashlib.sha256(wheel.encode()).hexdigest()),
+                               "licence": "MIT", "requires_python": None, "verified": "2026-11-16", "batch": "R"})  # fmt: skip
+            text, published = self.summary(tmp, staged)
+            self.assertEqual(published, [])
+            self.assertTrue(text.startswith(top.format(4) + "**0 published**, 0 in the index\n\n- "), text)
+            self.assertEqual(text.count("no install-test result for"), 4)
+            # A failure and a wheel the artifact doesn't mention aren't "no result": two left, the line stays.
+            self.artifact(tmp, json.dumps({"tested": {WIN: False}}))
+            text, published = self.summary(tmp, staged)
+            self.assertEqual(published, [])
+            self.assertTrue(text.startswith(top.format(2) + "**0 published**"), text)
+            self.assertIn(f"- {WIN}: failed the install test on a fresh runner; not published\n", text)
+            self.assertIn("- zstandard-0.14.0-cp314-cp314-win_arm64.whl: the install test for 3.14 win-arm64 gave no "
+                          "answer for it; not published\n", text)  # fmt: skip
+            # One wheel with no result has its own line and no line at the top.
+            self.artifact(tmp, json.dumps({"tested": {MUSL: True}}), slug="3.14-musl-aarch64")
+            text, published = self.summary(tmp, staged)
+            self.assertEqual(published, [MUSL])
+            self.assertTrue(text.startswith("**1 published**, 1 in the index\n\n- "), text)
+            self.assertEqual(text.count("no install-test result"), 1)
+            self.assertIn(f"- {GLIBC_T}: no install-test result for 3.14t linux-x86_64 (the test job didn't finish or "
+                          "its result couldn't be read); not published\n", text)  # fmt: skip
 
     def test_only_the_staging_jobs_output_is_trusted(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2568,7 +2717,7 @@ class RecipeStage(unittest.TestCase):
             entry, = json.loads((tmp / "index.json").read_text())["wheels"]
             self.assertEqual(entry["recipes"], [self.record])
             new, lines = gap_wheels.select([{**w, "recipes": [{**self.record, "url": "ftp://x"}]}],
-                                           {"3.14 win-arm64": {WIN: True}}, tmp / "files", {})  # fmt: skip
+                                           {"3.14 win-arm64": {WIN: True}}, tmp / "files", {}, {})  # fmt: skip
             self.assertEqual((new, lines), ([], [f"{WIN}: no verified library recipe; not published"]))
 
 
