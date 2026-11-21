@@ -9,6 +9,14 @@ working.)
 pip install --extra-index-url https://wheelgap.github.io/wheels/simple/ PACKAGE
 ```
 
+pip treats every index alike, so do this only if the packages you install from here come from PyPI: not if a private
+index (set in `pip.conf`, say) has packages of the same names.
+
+If your requirements file pins hashes (`--require-hashes`), also add each wheel's hash to its line, or pip won't use
+the wheel: `NAME==VERSION --hash=sha256:…`, with the wheel's full sha256. It's in
+[`data/status.json`](https://wheelgap.github.io/wheels/data/status.json), as the `sha256` of the row whose `wheel` is
+the file name.
+
 uv works too. Pin the packages you need to the index in `pyproject.toml`. uv only applies `[tool.uv.sources]` to direct
 dependencies, so a package that comes in through another one (tokenizers through transformers) must also be listed
 in `dependencies`:
@@ -22,6 +30,17 @@ explicit = true
 [tool.uv.sources]
 tokenizers = { index = "wheelgap" }
 ```
+
+Then run `uv lock`. If `pyproject.toml` already has a `[tool.uv.sources]` table, add the package's line to it instead
+of a second one.
+
+Other lockfiles (Poetry, PDM and the like) pin each file, so add `https://wheelgap.github.io/wheels/simple/` as an
+index (for these packages only, if the tool allows it) where that lockfile is made, then lock again. An index that
+isn't limited to these packages has the same risk as with pip: don't add it if a private index has packages of the
+same names.
+
+[wheelgap](https://github.com/wheelgap/wheelgap) has a `--fix` option on its main branch, not in a release yet, that
+prints these lines for the packages in your own requirements file or lockfile.
 
 uv takes all of a package's files from one index, so each project's page here lists every file PyPI has for it as well
 (PyPI's own links and hashes, refreshed hourly), plus our wheel. A lockfile made this way has the same files and hashes

@@ -1,3 +1,4 @@
+import html
 import http.client
 import json
 import re
@@ -484,6 +485,38 @@ class Index(unittest.TestCase):
         self.assertIn('url = "https://wheelgap.github.io/wheels/simple/"', page)
         self.assertIn("explicit = true", page)
         self.assertIn('tokenizers = { index = "wheelgap" }', page)
+
+    # Mirrors what `wheelgap --fix` prints next to its link to this page: PIP_CAVEAT, LOCK_CAVEAT, UV_MERGE and
+    # text_lines() in wheelgap's src/wheelgap/gapwheels.py (wheelgap/wheelgap). This repo doesn't depend on wheelgap,
+    # so the phrases are copied here: change one side and the other needs the same change. The README's opening
+    # section says the same four things.
+    def test_the_page_says_what_wheelgap_fix_says(self):
+        page = (self.build([wheel()]) / "index.html").read_text(encoding="utf-8")
+        how = page.split("<h2>How to use it</h2>", 1)[1].split("</section>", 1)[0]
+        text = html.unescape(re.sub(r"<[^>]+>", "", how))
+        index = "https://wheelgap.github.io/wheels/simple/"
+        # 1. A private index (PIP_CAVEAT).
+        self.assertIn("pip treats every index alike, so do this only if the packages below come from PyPI: not if a "
+                      "private index (set in pip.conf, say) has packages of the same names.", text)
+        # 2. Hash-pinned requirements: the line's form, and where the full sha256 is.
+        self.assertIn("If your requirements file pins hashes (--require-hashes), also add each wheel's hash to its "
+                      "line", text)
+        self.assertIn("NAME==VERSION --hash=sha256:", text)
+        self.assertRegex(how, r'<a href="data/status\.json">status\.json</a>, as the <code>sha256</code> of the row '
+                              r"whose <code>wheel</code> is the file name")
+        # 3. uv's next steps (text_lines' "then run uv lock", and UV_MERGE).
+        after_config = text.split('tokenizers = { index = "wheelgap" }', 1)[1]
+        self.assertTrue(after_config.lstrip().startswith("Then run uv lock."), after_config[:80])
+        self.assertIn("If pyproject.toml already has a [tool.uv.sources] table, add the package's line to it instead "
+                      "of a second one.", text)
+        # 4. Other lockfiles (text_lines' sentence, and LOCK_CAVEAT).
+        self.assertIn(f"pin each file, so add {index} as an index (for these packages only, if the tool allows it) "
+                      "where that lockfile is made, then lock again.", text)
+        self.assertIn("An index that isn't limited to these packages has the same risk as with pip: don't add it if "
+                      "a private index has packages of the same names.", text)
+        # The commands themselves are as they were, and --fix isn't said to be in a release.
+        self.assertIn(f"<pre><code>pip install --extra-index-url {index} PACKAGE</code></pre>", how)
+        self.assertIn("not in a release yet", text)
 
     def test_our_wheel_follows_pypi_yanking_its_release(self):
         sdist = pypi_file("tiktoken-0.14.0.tar.gz", yanked="security issue")

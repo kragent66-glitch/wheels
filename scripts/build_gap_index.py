@@ -453,7 +453,8 @@ def human_page(
       <h2>How to use it</h2>
       <p>With pip, add this index next to PyPI:</p>
       <pre><code>pip install --extra-index-url {e(INDEX_URL)} PACKAGE</code></pre>
-      <p>pip still gets everything else from PyPI. It only takes a wheel from here when PyPI doesn't have one for your machine.</p>
+      <p>Where PyPI is pip's other index, pip still gets everything else from PyPI, and only takes a wheel from here when PyPI doesn't have one for your machine. pip treats every index alike, so do this only if the packages below come from PyPI: not if a private index (set in <code>pip.conf</code>, say) has packages of the same names.</p>
+      <p>If your requirements file pins hashes (<code>--require-hashes</code>), also add each wheel's hash to its line, or pip won't use the wheel: <code>NAME==VERSION --hash=sha256:…</code>, with the wheel's full sha256. It's in <a href="data/status.json">status.json</a>, as the <code>sha256</code> of the row whose <code>wheel</code> is the file name. The table below shows only its first 12 characters.</p>
       <p>With uv, add the index to <code>pyproject.toml</code> and point only the packages you need at it. uv only applies <code>[tool.uv.sources]</code> to your direct dependencies, so if a package comes in through another one (tokenizers through transformers, say), add it to <code>dependencies</code> as well:</p>
       <pre><code>[[tool.uv.index]]
 name = "wheelgap"
@@ -462,7 +463,10 @@ explicit = true
 
 [tool.uv.sources]
 tokenizers = {{ index = "wheelgap" }}</code></pre>
+      <p>Then run <code>uv lock</code>. If <code>pyproject.toml</code> already has a <code>[tool.uv.sources]</code> table, add the package's line to it instead of a second one.</p>
       <p>uv takes all of a package's files from one index, so each package's page here lists every file PyPI has for it too, with PyPI's own links and hashes, plus our wheel. Everything else still comes from PyPI. <code>uv pip install --extra-index-url {e(INDEX_URL)} PACKAGE</code> works too.</p>
+      <p>Other lockfiles (Poetry, PDM and the like) pin each file, so add <code>{e(INDEX_URL)}</code> as an index (for these packages only, if the tool allows it) where that lockfile is made, then lock again. An index that isn't limited to these packages has the same risk as with pip: don't add it if a private index has packages of the same names.</p>
+      <p><a href="https://github.com/wheelgap/wheelgap">wheelgap</a> has a <code>--fix</code> option on its main branch, not in a release yet, that prints these lines for the packages in your own requirements file or lockfile.</p>
       <p>The PyPI part of the list is refreshed every hour, so with uv a release uploaded in the last hour may not show up yet for these packages. If PyPI can't be read, the index isn't updated at all, rather than going up with files missing. The pages are plain HTML, which has no upload times, so uv's <code>exclude-newer</code> finds no files for these packages here.</p>
       <p>Each wheel is for one release. If a newer release comes out without a wheel, pip or uv will try to build that one instead. Add <code>--prefer-binary</code> (pip) to keep using the wheel here. When the release ships its own wheel for the same platform, ours drops out of the index.</p>
     </section>
