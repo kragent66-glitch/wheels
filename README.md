@@ -177,16 +177,23 @@ mysqlclient and h5py anywhere, are skipped by the plan with "no library recipe f
 
 ## Checking a wheel yourself
 
-Use the filename and SHA-256 of a currently published wheel from
-[`data/gap-wheels.json`](data/gap-wheels.json). The examples below use
+To see whether the index serves a wheel now, find the row for its file name in
+[`data/status.json`](https://wheelgap.github.io/wheels/data/status.json): it does when the row's `status` is
+`in-index` or `yanked`. A yanked wheel is still served, but pip and uv only take it with an exact `==` pin.
+[`data/gap-wheels.json`](data/gap-wheels.json) is the full record, with each wheel's `sha256`, `sdist_sha256` and
+`builds`. It doesn't say whether a wheel is current: an entry stays there after its wheel drops out of the index
+because PyPI shipped its own or the release is gone from PyPI. The examples below print the status first, then
+check the file's hash against the record. They use
 `lightgbm-4.7.0-cp314-cp314-win_arm64.whl` and `lz4-4.4.5-cp314-cp314t-manylinux_2_28_x86_64.whl`;
-substitute another published filename for your platform. The attestation check needs the
+substitute another filename for your platform. The attestation check needs the
 [GitHub CLI](https://cli.github.com/), signed in (`gh auth login`), and the Linux example also needs `jq`.
 
 **Windows (PowerShell):**
 
 ```powershell
 $wheel = "lightgbm-4.7.0-cp314-cp314-win_arm64.whl"
+$status = @((Invoke-RestMethod "https://wheelgap.github.io/wheels/data/status.json").wheels | Where-Object { $_.wheel -eq $wheel } | ForEach-Object { $_.status })
+if ($status.Count -eq 1 -and $status[0] -in "in-index", "yanked") { "status: $status" } else { Write-Warning "the index doesn't serve $wheel now (status: $(if ($status) { $status -join ', ' } else { 'no entry in status.json' }))" }
 Invoke-WebRequest "https://github.com/wheelgap/wheels/releases/download/gap-wheels/$wheel" -OutFile $wheel -UseBasicParsing
 $index = Invoke-RestMethod "https://raw.githubusercontent.com/wheelgap/wheels/main/data/gap-wheels.json"
 $expected = @($index.wheels | Where-Object { $_.wheel -eq $wheel })
@@ -198,6 +205,13 @@ if ($expected.Count -eq 1 -and $actual -eq $expected[0].sha256) { "sha256 OK"; g
 
 ```sh
 wheel="lz4-4.4.5-cp314-cp314t-manylinux_2_28_x86_64.whl"
+state="$(curl -fsSL https://wheelgap.github.io/wheels/data/status.json \
+  | jq -r --arg wheel "$wheel" '[.wheels[] | select(.wheel == $wheel) | .status] | if length == 0 then "no entry in status.json" else join(", ") end')"
+case "$state" in
+  in-index | yanked) echo "status: $state" ;;
+  "") echo "status.json could not be read" >&2 ;;
+  *) echo "the index doesn't serve $wheel now (status: $state)" >&2 ;;
+esac
 curl -fL "https://github.com/wheelgap/wheels/releases/download/gap-wheels/$wheel" -o "$wheel"
 expected="$(curl -fsSL https://raw.githubusercontent.com/wheelgap/wheels/main/data/gap-wheels.json \
   | jq -r --arg wheel "$wheel" '[.wheels[] | select(.wheel == $wheel) | .sha256] | if length == 1 then .[0] else empty end')"
