@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from xml.etree import ElementTree
 
 from scripts import build_gap_index
 
@@ -677,6 +678,158 @@ class Index(unittest.TestCase):
         site = self.build([wheel(), wheel(name="../unsafe"), wheel(sha256="invalid")])
         rows = json.loads((site / "data/status.json").read_text())["wheels"]
         self.assertEqual([row["wheel"] for row in rows], [wheel()["wheel"]])
+
+    ATOM = {"a": "http://www.w3.org/2005/Atom"}
+
+    def feed(self, site):
+        """feed.xml parsed, after the checks every feed must pass: Atom's required elements, RFC 3339 dates and
+        unique entry ids."""
+        root = ElementTree.fromstring((site / "feed.xml").read_bytes())
+        self.assertEqual(root.tag, "{http://www.w3.org/2005/Atom}feed")
+        date = re.compile(r"\d{4}-\d{2}-\d{2}T00:00:00Z")
+        entries = root.findall("a:entry", self.ATOM)
+        for node in [root, *entries]:
+            for required in ("id", "title", "updated"):
+                self.assertEqual(len(node.findall(f"a:{required}", self.ATOM)), 1, required)
+            self.assertRegex(node.findtext("a:updated", namespaces=self.ATOM), date)
+        ids = [entry.findtext("a:id", namespaces=self.ATOM) for entry in entries]
+        self.assertEqual(len(ids), len(set(ids)), ids)
+        return root, entries
+
+    def test_feed_lists_the_wheels_in_the_index_newest_first(self):
+        lz4 = "lz4-4.4.5-cp314-cp314-win_arm64.whl"
+        gone = "regex-1.0-cp314-cp314-win_arm64.whl"
+        wheels = [
+            wheel(published="2026-11-16"),
+            wheel(name="lz4", file=lz4, version="4.4.5", published="2026-11-17"),
+            wheel(name="regex", file=gone, version="1.0", published="2026-11-18"),  # PyPI has its own now
+            wheel(name="zstd", file="zstd-1.0-cp314-cp314-win_arm64.whl", version="1.0", published="2026-11-19"),
+            wheel(name="Zope.Interface", file="zope_interface-8.7-cp314-cp314-win_arm64.whl", version="8.7",
+                  published="2026-11-17"),
+        ]  # fmt: skip
+        pypi = {"regex": [pypi_file(gone)], "zstd": [pypi_file("zstd-1.0.tar.gz", yanked="bad build")]}
+        site = self.build(wheels, pypi)
+        root, entries = self.feed(site)
+        text = lambda node, tag: node.findtext(f"a:{tag}", namespaces=self.ATOM)
+        self.assertEqual(text(root, "id"), "https://wheelgap.github.io/wheels/feed.xml")
+        self.assertEqual(text(root, "title"), "wheelgap gap wheels")
+        self.assertEqual(root.findtext("a:author/a:name", namespaces=self.ATOM), "wheelgap")
+        self.assertIn("Unofficial", text(root, "subtitle"))
+        self.assertEqual(root.find("a:link[@rel='self']", self.ATOM).get("href"), "https://wheelgap.github.io/wheels/feed.xml")
+        self.assertEqual(text(root, "updated"), "2026-11-19T00:00:00Z")  # the newest entry's
+        # Newest first, then by project and file name, reversed. The yanked one is in; the withdrawn one isn't.
+        release = "https://github.com/wheelgap/wheels/releases/download/gap-wheels/"
+        self.assertEqual(
+            [text(entry, "id") for entry in entries],
+            [release + name for name in ("zstd-1.0-cp314-cp314-win_arm64.whl",
+                                         "zope_interface-8.7-cp314-cp314-win_arm64.whl", lz4, wheel()["wheel"])],
+        )
+        entry = entries[2]
+        self.assertEqual(text(entry, "title"), "lz4 4.4.5 for 3.14 win-arm64")
+        self.assertEqual(entry.find("a:link", self.ATOM).get("href"), "https://wheelgap.github.io/wheels/#lz4")
+        self.assertEqual(text(entry, "updated"), "2026-11-17T00:00:00Z")
+        summary = text(entry, "summary")
+        self.assertIn("pip install --extra-index-url https://wheelgap.github.io/wheels/simple/ lz4==4.4.5", summary)
+        self.assertIn(f"sha256: {SHA}", summary)
+        self.assertIn("Unofficial wheel, built by wheelgap from the PyPI sdist", summary)
+        # The page links the feed, in its head and next to status.json, and each entry's link is a row's anchor.
+        page = (site / "index.html").read_text(encoding="utf-8")
+        head = page.split("</head>", 1)[0]
+        self.assertIn('<link rel="alternate" type="application/atom+xml" href="feed.xml" title="New gap wheels">', head)
+        self.assertIn('<a href="feed.xml">Atom feed</a>', page.split("</head>", 1)[1])
+        self.assertIn('<tr id="lz4">', page)
+        # Left out with --omit-failing: not in the feed either.
+        bad = pypi_file("lz4-4.4.5.tar.gz", url="https://untrusted.example/sdist.tar.gz")
+        _, entries = self.feed(self.build(wheels[:2], {"lz4": [bad]}, omit_failing=True))
+        self.assertEqual([text(entry, "id") for entry in entries], [release + wheel()["wheel"]])
+
+    def test_feed_is_capped_at_50_entries(self):
+        wheels = [
+            wheel(name=f"pkg{n}", file=f"pkg{n}-1.0-cp314-cp314-win_arm64.whl", published=f"2026-10-{n % 28 + 1:02d}")
+            for n in range(60)
+        ]
+        root, entries = self.feed(self.build(wheels))
+        self.assertEqual(len(entries), 50)
+        days = [entry.findtext("a:updated", namespaces=self.ATOM) for entry in entries]
+        self.assertEqual(days, sorted(days, reverse=True))
+        self.assertEqual(days[0], "2026-10-28T00:00:00Z")
+        self.assertEqual(root.findtext("a:updated", namespaces=self.ATOM), days[0])
+        self.assertGreater(days[-1], "2026-10-03T00:00:00Z")  # the ten oldest are the ones dropped
+
+    def test_feed_skips_an_entry_without_a_valid_published_date(self):
+        names = ("none", "day", "notpadded", "number", "time", "markup", "trailing")
+        values = (None, "2026-02-30", "2026-1-5", 20261116, "2026-11-16T00:00:00Z", "<x>", "2026-11-16\n")
+        wheels = [wheel(published="2026-11-16")]
+        for name, value in zip(names, values, strict=True):
+            w = wheel(name=name, file=f"{name}-1.0-cp314-cp314-win_arm64.whl")
+            if value is not None:
+                w["published"] = value
+            wheels.append(w)
+        site = self.build(wheels)
+        _, entries = self.feed(site)
+        self.assertEqual([entry.findtext("a:title", namespaces=self.ATOM) for entry in entries],
+                         ["tiktoken 0.14.0 for 3.14 win-arm64"])
+        # They are still in the index and on the page: only the feed needs the date.
+        self.assertEqual(len(json.loads((site / "data/status.json").read_text())["wheels"]), 8)
+
+    def test_feed_escapes_free_text(self):
+        odd = wheel(target='<x>&"', version="1.0]]>\x00\x0b<!--", published="2026-11-16")
+        site = self.build([odd, wheel(name="lz4", file="lz4-4.4.5-cp314-cp314-win_arm64.whl", version=None, target=3,
+                                      published="2026-11-15")])  # fmt: skip
+        raw = (site / "feed.xml").read_text(encoding="utf-8")
+        self.assertIn("for &lt;x&gt;&amp;&quot;</title>", raw)
+        self.assertNotIn("<x>", raw)
+        self.assertNotIn("\x00", raw)
+        _, entries = self.feed(site)
+        # Control characters XML can't carry are dropped; everything else comes back as it was written.
+        self.assertEqual(entries[0].findtext("a:title", namespaces=self.ATOM), 'tiktoken 1.0]]><!-- for <x>&"')
+        # A version or target that isn't a string: the title is the file name.
+        self.assertEqual(entries[1].findtext("a:title", namespaces=self.ATOM), "lz4-4.4.5-cp314-cp314-win_arm64.whl")
+
+    def test_feed_updated_comes_from_the_data_never_the_clock(self):
+        gone = "regex-1.0-cp314-cp314-win_arm64.whl"
+        withdrawn = wheel(name="regex", file=gone, version="1.0", published="2026-11-18")
+        updated = lambda site: self.feed(site)[0].findtext("a:updated", namespaces=self.ATOM)
+        # No entries: the newest `published` of any record, or the epoch when there is none.
+        site = self.build([withdrawn, wheel(name="lz4", file="lz4-1.0-cp314-cp314-win_arm64.whl", published="2026-11-01"),
+                           wheel()], {"regex": [pypi_file(gone)], "lz4": [pypi_file("lz4-1.0-cp314-cp314-win_arm64.whl")]})  # fmt: skip
+        self.assertEqual(updated(site), "2026-11-18T00:00:00Z")
+        self.assertEqual(self.feed(site)[1], [])
+        self.assertEqual(updated(self.build([wheel()])), "1970-01-01T00:00:00Z")
+        self.assertEqual(updated(self.build([])), "1970-01-01T00:00:00Z")
+        # With entries: the newest entry's, not a newer withdrawn record's.
+        site = self.build([withdrawn, wheel(published="2026-11-16")], {"regex": [pypi_file(gone)]})
+        self.assertEqual(updated(site), "2026-11-16T00:00:00Z")
+
+    def test_feed_is_identical_for_identical_inputs(self):
+        wheels = [wheel(published="2026-11-16"),
+                  wheel(name="lz4", file="lz4-4.4.5-cp314-cp314-win_arm64.whl", version="4.4.5", published="2026-11-16")]
+        a = (self.build(wheels) / "feed.xml").read_bytes()
+        b = (self.build(list(reversed(wheels))) / "feed.xml").read_bytes()
+        self.assertEqual(a, b)
+        self.assertTrue(a.startswith(b'<?xml version="1.0" encoding="utf-8"?>\n<feed xmlns="http://www.w3.org/2005/Atom">\n'))
+        self.assertTrue(a.endswith(b"</feed>\n"))
+
+    def test_feed_lists_a_file_recorded_twice_once(self):
+        _, entries = self.feed(self.build([wheel(published="2026-11-16"), wheel(published="2026-11-17")]))
+        self.assertEqual(len(entries), 1)
+
+    def test_a_failed_fetch_writes_no_feed(self):
+        bad = pypi_file("tiktoken-0.14.0.tar.gz", url="https://untrusted.example/sdist.tar.gz")
+        site = self.build([wheel(published="2026-11-16")], {"tiktoken": [bad]}, expect=1)
+        self.assertFalse((site / "feed.xml").exists())
+        self.assertFalse(site.exists())
+
+    def test_current_published_data_makes_a_feed_of_every_entry_or_the_newest_50(self):
+        path = Path(__file__).resolve().parents[1] / "data" / "gap-wheels.json"
+        published = json.loads(path.read_text(encoding="utf-8"))["wheels"]
+        by_project = build_gap_index.projects(published)
+        status = {(project, w["wheel"]): "in-index" for project, wheels in by_project.items() for w in wheels}
+        root = ElementTree.fromstring(build_gap_index.feed(by_project, status))
+        entries = root.findall("a:entry", self.ATOM)
+        self.assertEqual(len(entries), min(len(published), 50))
+        self.assertEqual(root.findtext("a:updated", namespaces=self.ATOM),
+                         max(w["published"] for w in published) + "T00:00:00Z")
 
 
 class Requests(Index):

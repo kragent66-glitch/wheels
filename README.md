@@ -128,6 +128,8 @@ pinned with `==`); `withdrawn-pypi-has-wheel` (PyPI now has a wheel that install
 `withdrawn-release-gone` (PyPI no longer lists the release); or `left-out-pypi-unreadable` (left out of this deploy
 because PyPI couldn't be read, back at the next good build). `yank_reason` is PyPI's reason for a yanked wheel (`""`
 when it gave none) and `null` otherwise. A wheel that was taken down or opted out has no entry.
+[`feed.xml`](https://wheelgap.github.io/wheels/feed.xml), built with it, is an Atom feed of the wheels in the index
+(`in-index` or `yanked`), newest first by publish date, at most 50.
 
 **Bundled Microsoft DLLs.** Some Windows wheels carry Microsoft Visual C++ runtime files (`msvcp140.dll`,
 `vcomp140.dll` and the like) in `<dist>.libs/`. They're Microsoft's, not the package's, redistributed under the
