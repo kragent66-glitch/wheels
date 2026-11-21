@@ -497,6 +497,29 @@ class Index(unittest.TestCase):
         page = (self.build([wheel()], {"tiktoken": other}) / "simple/tiktoken/index.html").read_text()
         self.assertIn(f'#sha256={SHA}" data-requires-python="&gt;=3.9">tiktoken-0.14.0-cp314', page)
 
+    def test_the_page_shows_a_yanked_wheel_as_yanked_with_pypis_reason(self):
+        lz4 = wheel(name="lz4", file="lz4-4.4.5-cp314-cp314-win_arm64.whl", version="4.4.5")
+
+        def rows(reason):
+            site = self.build([wheel(), lz4], {"tiktoken": [pypi_file("tiktoken-0.14.0.tar.gz", yanked=reason)]})
+            page = (site / "index.html").read_text(encoding="utf-8")
+            return [page.split(f'<tr id="{p}">', 1)[1].split("</tr>", 1)[0] for p in ("tiktoken", "lz4")], page
+
+        (yanked, other), page = rows("broken release")
+        self.assertTrue(yanked.endswith("<td>in the index, but PyPI has yanked this release: broken release</td>"))
+        self.assertIn("tiktoken==0.14.0</code>", yanked)  # the == pin is how pip and uv still take a yanked file
+        self.assertIn(">report</a>", yanked)
+        self.assertTrue(other.endswith("<td>in the index</td>"), other)
+        self.assertIn(" 2 so far.", page)  # a yanked wheel is still in the index
+        (yanked, _), page = rows("<b>bad</b>")
+        self.assertTrue(yanked.endswith("yanked this release: &lt;b&gt;bad&lt;/b&gt;</td>"), yanked)
+        self.assertNotIn("<b>", page)
+        for no_reason in (True, ""):
+            with self.subTest(no_reason):
+                (yanked, other), _ = rows(no_reason)
+                self.assertTrue(yanked.endswith("<td>in the index, but PyPI has yanked this release</td>"), yanked)
+                self.assertTrue(other.endswith("<td>in the index</td>"), other)
+
     def test_our_wheel_leaves_when_pypi_no_longer_has_the_release(self):
         site = self.build([wheel()], {"tiktoken": [pypi_file("tiktoken-0.15.0.tar.gz")]}, sdists=False)
         self.assertNotIn("releases/download", (site / "simple/tiktoken/index.html").read_text())

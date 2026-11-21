@@ -358,9 +358,14 @@ def human_page(
     by_project: dict[str, list[dict]],
     gone: dict[tuple[str, str], str] | None = None,
     requests: dict[str, dict[str, str]] | None = None,
+    yanked: dict[tuple[str, str], str] | None = None,
 ) -> str:
+    """The page. `gone`: why a wheel isn't in the index, and `yanked`: PyPI's reason ("" when it gave none) for a
+    wheel that is in the index but whose release PyPI has yanked, both by (project, wheel file name) as build() keys
+    them."""
     gone = gone or {}
     requests = requests or {}
+    yanked = yanked or {}
     e = html.escape
     rows = []
     for project, wheels in by_project.items():
@@ -394,6 +399,14 @@ def human_page(
                 if (project, w["wheel"]) not in gone
                 else ""
             )
+            key = (project, w["wheel"])
+            if key in gone:
+                state = gone[key]
+            elif key in yanked:
+                # Still served, and the Install cell's == pin is the one case where pip and uv take a yanked file.
+                state = "in the index, but PyPI has yanked this release" + (f": {yanked[key]}" if yanked[key] else "")
+            else:
+                state = "in the index"
             rows.append(
                 f'          <tr{anchor}><td><a href="{e(TRACKER)}p/{e(project)}/">{e(w["name"])}</a>{note}</td>'
                 f"<td>{e(str(w.get('version', '')))}</td><td>{e(str(w.get('target', '')))}</td>"
@@ -401,7 +414,7 @@ def human_page(
                 f'<td><a href="{e(RELEASE_URL + w["wheel"])}" aria-label="wheel {e(w["wheel"])}">wheel</a>'
                 f'<br><small title="{e(w["sha256"])}">{e(w["sha256"][:12])}</small>{library}{report}</td>'
                 f"<td>{install}</td>"
-                f"<td>{e(gone.get((project, w['wheel']), 'in the index'))}</td></tr>"
+                f"<td>{e(state)}</td></tr>"
             )
     count = sum(len(v) for v in by_project.values()) - len(gone)
     # A heading's id has an underscore so no package row's id (a canonical name: a-z, 0-9 and -) can clash with it.
@@ -544,7 +557,7 @@ def build(
         (simple / project).mkdir(exist_ok=True)
         (simple / project / "index.html").write_text(simple_page(f"Links for {project}", links), encoding="utf-8")
     requests = read_requests(index_path.parent / "gap-wheel-requests.json")
-    (site / "index.html").write_text(human_page(by_project, gone, requests), encoding="utf-8")
+    (site / "index.html").write_text(human_page(by_project, gone, requests, yanked), encoding="utf-8")
     (site / "data").mkdir(exist_ok=True)
     (site / "data" / "gap-wheels.json").write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
     # Each status is set where build() decides it, never parsed back out of `gone`'s text. `usable` doesn't check
