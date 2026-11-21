@@ -33,7 +33,7 @@ import time
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 BASE_URL = "https://wheelgap.github.io/wheels/"
 TRACKER = "https://wheelgap.github.io/tracker/"
@@ -52,6 +52,17 @@ OPT_OUT_URL = (
     "https://github.com/wheelgap/wheels/issues/new?title=Opt-out%3A%20PROJECT"
     "&body=Please%20stop%20publishing%20gap%20wheels%20for%20PROJECT."
 )
+# The public form for a wheel that doesn't install, import or run (.github/ISSUE_TEMPLATE/broken-wheel.yml), and
+# GitHub's private report for one that looks unsafe (SECURITY.md).
+BROKEN_WHEEL_URL = "https://github.com/wheelgap/wheels/issues/new?template=broken-wheel.yml"
+ADVISORY_URL = "https://github.com/wheelgap/wheels/security/advisories/new"
+
+
+def report_url(wheel: str) -> str:
+    """The broken-wheel form with this file name filled in: GitHub fills an issue form's field from a query parameter
+    named after the field's id (`wheel` in broken-wheel.yml), and the title from `title`."""
+    name = quote(wheel, safe="")
+    return f"{BROKEN_WHEEL_URL}&wheel={name}&title=Broken%20wheel%3A%20{name}"
 
 
 def canonical(name: str) -> str:
@@ -378,17 +389,22 @@ def human_page(
                 else ""
             )
             library = f"<br><small>{e(text)}</small>" if (text := bundled(w)) else ""
+            report = (
+                f'<br><a href="{e(report_url(w["wheel"]))}" aria-label="report a problem with {e(w["wheel"])}">report</a>'
+                if (project, w["wheel"]) not in gone
+                else ""
+            )
             rows.append(
                 f'          <tr{anchor}><td><a href="{e(TRACKER)}p/{e(project)}/">{e(w["name"])}</a>{note}</td>'
                 f"<td>{e(str(w.get('version', '')))}</td><td>{e(str(w.get('target', '')))}</td>"
                 f"<td>{e(str(w.get('verified') or ''))}</td><td>{links}</td>"
                 f'<td><a href="{e(RELEASE_URL + w["wheel"])}" aria-label="wheel {e(w["wheel"])}">wheel</a>'
-                f'<br><small title="{e(w["sha256"])}">{e(w["sha256"][:12])}</small>{library}</td>'
+                f'<br><small title="{e(w["sha256"])}">{e(w["sha256"][:12])}</small>{library}{report}</td>'
                 f"<td>{install}</td>"
                 f"<td>{e(gone.get((project, w['wheel']), 'in the index'))}</td></tr>"
             )
     count = sum(len(v) for v in by_project.values()) - len(gone)
-    # The heading's id has an underscore so no package row's id (a canonical name: a-z, 0-9 and -) can clash with it.
+    # A heading's id has an underscore so no package row's id (a canonical name: a-z, 0-9 and -) can clash with it.
     table = (
         '        <div class="matrix-scroll" tabindex="0" role="region" aria-labelledby="published_wheels"><table class="matrix">\n'
         '          <thead><tr><th scope="col">Package</th><th scope="col">Version</th>'
@@ -419,6 +435,7 @@ def human_page(
     <p class="lede">Some popular Python packages don't have a wheel on PyPI yet for Windows on ARM, for free-threaded Python 3.14t, for Alpine Linux on ARM or for Python 3.15. When that happens pip tries to build them from source, which needs Rust or a C compiler and often fails. These are the missing wheels. {count} so far.</p>
   </header>
   <main class="wrap">
+    <p>These wheels are unofficial. wheelgap builds each one from the sdist PyPI has for that release. The package's maintainers didn't build them and haven't reviewed them. If one doesn't work or looks wrong, <a href="#report_a_problem">report it here</a>, not to the package.</p>
     <section>
       <h2>How to use it</h2>
       <p>With pip, add this index next to PyPI:</p>
@@ -449,7 +466,15 @@ tokenizers = {{ index = "wheelgap" }}</code></pre>
         <li>Every wheel, its source hash and both build runs are listed in <a href="data/gap-wheels.json">gap-wheels.json</a>; the machine-readable <a href="data/status.json">status.json</a> shows which ones are currently in the index, yanked or withdrawn.</li>
       </ul>
       <p>One thing to know: a wheel here is only as safe as the source it was built from. Installing the package the normal way runs the same code. Only packages with an OSI-approved licence (or the PSF licence Python uses) go up. Some Windows wheels also carry Microsoft's Visual C++ runtime DLLs (in a <code>.libs</code> folder), redistributed under Visual Studio's terms, as many wheels on PyPI do.</p>
-      <p>The platforms: Windows on ARM for Python 3.14 and 3.14t, Windows x64 for Python 3.15, Linux x86_64 (glibc 2.28 or newer: <code>manylinux_2_28</code>) for Python 3.14t and 3.15, and Alpine Linux on ARM (<code>musllinux_1_2</code>) for Python 3.14. Every wheel goes up only after a maintainer approves a publish run that includes it; the table below shows which are here.</p>
+      <p>The platforms: Windows on ARM for Python 3.14 and 3.14t, Windows x64 for Python 3.15, Linux x86_64 (glibc 2.28 or newer: <code>manylinux_2_28</code>) for Python 3.14t and 3.15, and Alpine Linux on ARM (<code>musllinux_1_2</code>) for Python 3.14. Every wheel goes up only after a wheelgap maintainer approves a publish run that includes it; the table below shows which are here.</p>
+    </section>
+    <section>
+      <h2 id="report_a_problem">Problems with a wheel</h2>
+      <p>These wheels come from wheelgap, not from the package's maintainers, so a problem with one belongs here, not in the package's issue tracker.</p>
+      <ul>
+        <li>If a wheel doesn't install, doesn't import or fails when you use it, fill in the <a href="{e(BROKEN_WHEEL_URL)}">broken-wheel form</a>. The "report" link in a wheel's row below opens the form with its file name filled in.</li>
+        <li>If a wheel looks unsafe or tampered with, <a href="{e(ADVISORY_URL)}">report it privately</a>, never in a public issue. A wheel reported this way is taken down first and investigated after: it's removed from the index and the release while we look.</li>
+      </ul>
     </section>
     <section>
       <h2>If it's your package</h2>

@@ -185,7 +185,7 @@ class Index(unittest.TestCase):
         page = (self.build([with_recipe, wheel()]) / "index.html").read_text()
         self.assertEqual(page.count("<small>bundles libyaml 0.2.5 (MIT)</small>"), 1)
         row = next(line for line in page.splitlines() if 'id="pyyaml"' in line)
-        self.assertIn(f'<small title="{SHA}">{SHA[:12]}</small><br><small>bundles libyaml 0.2.5 (MIT)</small></td>', row)
+        self.assertIn(f'<small title="{SHA}">{SHA[:12]}</small><br><small>bundles libyaml 0.2.5 (MIT)</small><br><a href=', row)
         self.assertNotIn("bundles", next(line for line in page.splitlines() if 'id="tiktoken"' in line))
         self.assertEqual(build_gap_index.bundled(wheel()), "")
         two = [libyaml, {**libyaml, "library": "zlib-ng", "version": "2.2.4", "licence": "Zlib"}]
@@ -248,6 +248,53 @@ class Index(unittest.TestCase):
         self.assertIn("withdrawn: PyPI has its own now", row)
         self.assertIn("<td></td>", row)
         self.assertNotIn("pip install", row)
+
+    def test_the_page_says_the_wheels_are_unofficial_and_where_to_report(self):
+        page = (self.build([wheel()]) / "index.html").read_text(encoding="utf-8")
+        intro = page.split("</header>", 1)[1].split("<section>", 1)[0]
+        self.assertIn("These wheels are unofficial.", intro)
+        self.assertIn("The package's maintainers didn't build them and haven't reviewed them.", intro)
+        self.assertIn("a wheelgap maintainer approves a publish run", page)
+        self.assertNotIn("after a maintainer approves", page)
+        section = page.split('<h2 id="report_a_problem">Problems with a wheel</h2>', 1)[1].split("</section>", 1)[0]
+        self.assertIn('<a href="https://github.com/wheelgap/wheels/issues/new?template=broken-wheel.yml">', section)
+        self.assertIn('<a href="https://github.com/wheelgap/wheels/security/advisories/new">', section)
+        self.assertIn("taken down first and investigated after", section)
+        self.assertIn('href="#report_a_problem"', intro)
+        self.assertEqual(page.count('id="report_a_problem"'), 1)
+        self.assertIn("Content-Security-Policy", page)
+        self.assertNotIn("<script", page)
+
+    def test_each_row_in_the_index_links_the_report_form_with_its_file_name(self):
+        lz4 = "lz4-4.4.5-cp314-cp314-win_arm64.whl"
+        page = (self.build([wheel(), wheel(name="lz4", file=lz4, version="4.4.5")]) / "index.html").read_text()
+        for project, file in (("tiktoken", wheel()["wheel"]), ("lz4", lz4)):
+            with self.subTest(project):
+                row = page.split(f'<tr id="{project}">', 1)[1].split("</tr>", 1)[0]
+                self.assertIn(
+                    '<br><a href="https://github.com/wheelgap/wheels/issues/new?template=broken-wheel.yml'
+                    f'&amp;wheel={file}&amp;title=Broken%20wheel%3A%20{file}" '
+                    f'aria-label="report a problem with {file}">report</a></td>',
+                    row,
+                )
+                self.assertEqual(row.count(">report</a>"), 1)
+                self.assertNotIn("&wheel=", row)
+        labels = re.findall(r'aria-label="(report a problem with [^"]+)"', page)
+        self.assertEqual(len(labels), len(set(labels)), labels)
+        # Everything but letters, digits and "_.-~" is percent-encoded, so a file name can't add a query parameter.
+        self.assertEqual(
+            build_gap_index.report_url("a&b=c d+e-1.0.whl"),
+            "https://github.com/wheelgap/wheels/issues/new?template=broken-wheel.yml"
+            "&wheel=a%26b%3Dc%20d%2Be-1.0.whl&title=Broken%20wheel%3A%20a%26b%3Dc%20d%2Be-1.0.whl",
+        )
+
+    def test_withdrawn_wheel_has_no_report_link(self):
+        filename = "tiktoken-0.14.0-cp314-cp314-win_arm64.whl"
+        page = (self.build([wheel()], {"tiktoken": [pypi_file(filename)]}) / "index.html").read_text()
+        row = page.split('<tr id="tiktoken">', 1)[1].split("</tr>", 1)[0]
+        self.assertIn("withdrawn: PyPI has its own now", row)
+        self.assertNotIn("report", row)
+        self.assertNotIn("issues/new", row)
 
     def test_install_command_ignores_untrusted_version_field(self):
         page = (self.build([wheel(version="1.0; rm -rf ~")]) / "index.html").read_text()
